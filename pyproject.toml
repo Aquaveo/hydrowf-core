@@ -1,0 +1,21 @@
+[project]
+name = "hydrowf-core"
+version = "0.1.0"
+description = "hydrowf core library: lego models (tools, data, pipelines), importers, runtime adapters, data drivers"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2",
+  "pyyaml>=6",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "flake8>=7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
