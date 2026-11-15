@@ -6,6 +6,7 @@ its argument list filled in (ToolLego.argv). File and directory ports become Arg
   repository (the bucket is not passed on)
 - a link between steps is `from: {{tasks.<step>.outputs.artifacts.<output>}}`
 - a tool's `files` are raw artifacts
+- {run} in args and env becomes {{workflow.name}}, which Argo fills when the pod starts
 
 What running on Argo v4.1.6 taught us (hydrowf-platform docs/argo-findings.md):
 - the emissary executor needs the container `command`; with `args` only it asks the image registry
@@ -23,6 +24,7 @@ from hydrowf_core.models.lego import (DataSource, Lego, Link, Pipeline, Pipeline
                                       fill, value_problem)
 
 FILE_TYPES = ("file", "directory")
+RUN_NAME = "{{workflow.name}}"          # {run}: Argo puts the workflow's name here when the pod starts
 Entrypoint = Callable[[str], "list[str] | None"]
 
 
@@ -99,7 +101,7 @@ def task_inputs(step: Step, tool: ToolLego,
 def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | None], staged: Iterable[str],
                        entrypoint: Entrypoint | None) -> dict:
     """One step's Argo template: stage inputs and files under the workdir, run, collect outputs."""
-    runtime = {**scalars, "workdir": tool.workdir, "cpu": tool.cpu}
+    runtime = {**scalars, "workdir": tool.workdir, "cpu": tool.cpu, "run": RUN_NAME}
 
     def at(path: str) -> str:
         return f"{tool.workdir}/{fill(path, runtime)}"

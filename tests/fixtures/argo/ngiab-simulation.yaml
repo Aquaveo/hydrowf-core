@@ -139,6 +139,8 @@ spec:
       - /work/ngen-run
       - --output
       - /work/ngen-run_cng
+      - --run-id
+      - '{{workflow.name}}'
       - --configuration-name
       - ngiab_cfe_default
       workingDir: /work

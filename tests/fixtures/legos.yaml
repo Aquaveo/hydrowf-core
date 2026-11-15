@@ -178,12 +178,12 @@
     - "{ngen_run}"
     - --output
     - "{workdir}/ngen-run_cng"
-    - {when: run_id, args: [--run-id, "{run_id}"]}
+    - --run-id
+    - "{run}"                       # the platform's id for this run (Argo: the workflow name)
     - --configuration-name
     - "{configuration_name}"
   inputs:
     - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
-    - {name: run_id, type: string, optional: true, description: "empty = the run folder name"}
     - {name: configuration_name, type: string, default: ngiab, description: TEEHR configuration name}
   outputs:
     - {name: cng, type: directory, data: ngen-cng, path: ngen-run_cng}
