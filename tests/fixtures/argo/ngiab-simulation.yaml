@@ -1,0 +1,112 @@
+# Expected render() of ngiab-simulation for test_argo.INPUTS. argo lint --offline: no errors.
+# Same commands and flag/value pairs as the CWL translator's output that ran on Argo v4.1.6.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: ngiab-simulation-
+  labels:
+    hydrowf/pipeline: ngiab-simulation
+    hydrowf/version: 0.1.0
+  annotations:
+    hydrowf/outputs: '{"run": "run/ngen-run"}'
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    dag:
+      tasks:
+      - name: preprocess
+        template: step-preprocess
+        arguments:
+          artifacts:
+          - name: hydrofabric
+            s3:
+              key: inputs/hydrofabric/v2.2/conus_nextgen.gpkg
+      - name: run
+        template: step-run
+        dependencies:
+        - preprocess
+        arguments:
+          artifacts:
+          - name: ngen-run
+            from: '{{tasks.preprocess.outputs.artifacts.ngen-run}}'
+  - name: step-preprocess
+    inputs:
+      artifacts:
+      - name: hydrofabric
+        path: /work/.ngiab/hydrofabric/v2.2/conus_nextgen.gpkg
+      - name: file-0
+        path: /work/.ngiab/hydrofabric/v2.2/no_update
+        raw:
+          data: ''
+    outputs:
+      artifacts:
+      - name: ngen-run
+        path: /work/ngen-run
+    volumes:
+    - name: work
+      emptyDir: {}
+    container:
+      image: hydrowf/ngiab-preprocess:4.9.5.dev2-02c4145
+      command:
+      - cli
+      args:
+      - --output_root
+      - /work
+      - -o
+      - /work/ngen-run
+      - -s
+      - -f
+      - -r
+      - -i
+      - gage-01031510
+      - --start_date
+      - '2017-10-01'
+      - --end_date
+      - '2019-09-30'
+      - --source
+      - nwm
+      - --subset_type
+      - nexus
+      - --precip_max_gap
+      - '6'
+      workingDir: /work
+      env:
+      - name: HOME
+        value: /work
+      resources:
+        requests:
+          cpu: '4'
+          memory: 16384Mi
+      volumeMounts:
+      - name: work
+        mountPath: /work
+  - name: step-run
+    inputs:
+      artifacts:
+      - name: ngen-run
+        path: /work/ngen-run
+    outputs:
+      artifacts:
+      - name: ngen-run
+        path: /work/ngen-run
+    volumes:
+    - name: work
+      emptyDir: {}
+    container:
+      image: awiciroh/ciroh-ngen-image@sha256:d5ee1a6c15c025f9be2f9ce140dd9cdc2e933bc30f531a41f180d45b15c8ab17
+      command:
+      - /ngen/HelloNGEN.sh
+      args:
+      - /work/ngen-run
+      - auto
+      - '4'
+      - local
+      workingDir: /work
+      resources:
+        requests:
+          cpu: '4'
+          memory: 2048Mi
+      volumeMounts:
+      - name: work
+        mountPath: /work

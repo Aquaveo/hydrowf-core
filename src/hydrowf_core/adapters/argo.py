@@ -1,0 +1,172 @@
+"""Pipeline lego -> Argo Workflow (a dict: yaml.safe_dump it for `argo submit`, or post it to the API).
+
+Values are resolved when the workflow is written: each step becomes one container template with
+its argument list filled in (ToolLego.argv). File and directory ports become Argo artifacts:
+- a pipeline input is an s3://<bucket>/<key> URL; Argo reads the key from its default artifact
+  repository (the bucket is not passed on)
+- a link between steps is `from: {{tasks.<step>.outputs.artifacts.<output>}}`
+- a tool's `files` are raw artifacts
+
+What running on Argo v4.1.6 taught us (hydrowf-platform docs/argo-findings.md):
+- the emissary executor needs the container `command`; with `args` only it asks the image registry
+  for the ENTRYPOINT, which fails for images the registry won't describe (local, private). Pass
+  `entrypoint` for tools that leave `command` empty, or the image must be in a public registry.
+- an output artifact is one exact path.
+- the workdir is an emptyDir volume; inputs are staged inside it.
+"""
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Iterable, Mapping
+
+from hydrowf_core.models.lego import (DataSource, Lego, Link, Pipeline, PipelineInput, Scalar, Step, ToolLego, Value,
+                                      fill, value_problem)
+
+FILE_TYPES = ("file", "directory")
+Entrypoint = Callable[[str], "list[str] | None"]
+
+
+class UnsupportedForArgo(ValueError):
+    """The pipeline uses something this adapter can't run yet."""
+
+
+class BadInputs(ValueError):
+    """The run's input values don't fit the pipeline's inputs."""
+
+
+def k8s_name(name: str) -> str:
+    return name.replace("_", "-")
+
+
+def s3_key(url: object) -> str:
+    if not isinstance(url, str) or not url.startswith("s3://") or url.count("/") < 3:
+        raise BadInputs(f"{url!r}: a file or directory input is an s3://<bucket>/<key> URL")
+    return url.split("/", 3)[3]
+
+
+def pipeline_values(pipeline: Pipeline, inputs: Mapping[str, Scalar]) -> dict[str, Scalar | None]:
+    """The run's value for every pipeline input (given, or the port's default); checks each one."""
+    unknown = sorted(inputs.keys() - {p.name for p in pipeline.inputs})
+    if unknown:
+        raise BadInputs(f"{pipeline.id} has no inputs {unknown}")
+    values: dict[str, Scalar | None] = {}
+    for port in pipeline.inputs:
+        value = inputs.get(port.name, port.default)
+        if value is None:
+            if not port.optional:
+                raise BadInputs(f"input {port.name} is required")
+        elif port.type in FILE_TYPES:
+            s3_key(value)
+        elif port.type == "dataset":
+            raise UnsupportedForArgo(f"input {port.name}: dataset inputs need a data driver")
+        elif problem := value_problem(port.type, port.symbols, value):
+            raise BadInputs(f"input {port.name}: {problem}")
+        values[port.name] = value
+    return values
+
+
+def task_inputs(step: Step, tool: ToolLego,
+                values: dict[str, Scalar | None]) -> tuple[dict[str, Scalar | None], dict[str, dict]]:
+    """Where each of the tool's inputs comes from, for one step.
+
+    Returns (scalars, artifacts):
+    - scalars: input name -> value, for every non-file input (unset optional ones as None)
+    - artifacts: input name -> Argo artifact source, for file/directory inputs that have one:
+      {"s3": {"key": ...}} from a pipeline input, {"from": "{{tasks...}}"} from a link
+    """
+    scalars: dict[str, Scalar | None] = {}
+    artifacts: dict[str, dict] = {}
+    for port in tool.inputs:                      # the ports, so unconnected ones get their default
+        src = step.inputs.get(port.name)
+        if isinstance(src, DataSource):
+            raise UnsupportedForArgo(f"step {step.name}.{port.name}: dataset inputs need a data driver")
+        if isinstance(src, Link):
+            artifacts[port.name] = {"from": f"{{{{tasks.{src.step}.outputs.artifacts.{k8s_name(src.output)}}}}}"}
+            continue
+        if isinstance(src, Value):
+            value = src.value
+        elif isinstance(src, PipelineInput):
+            value = values[src.input]
+        else:
+            value = port.default
+        if port.type not in FILE_TYPES:
+            scalars[port.name] = value            # None too: argv needs every name
+        elif value is not None:                   # an unset optional file is simply not staged
+            artifacts[port.name] = {"s3": {"key": s3_key(value)}}
+    return scalars, artifacts
+
+
+def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | None], staged: Iterable[str],
+                       entrypoint: Entrypoint | None) -> dict:
+    """One step's Argo template: stage inputs and files under the workdir, run, collect outputs."""
+    runtime = {**scalars, "workdir": tool.workdir, "cpu": tool.cpu}
+
+    def at(path: str) -> str:
+        return f"{tool.workdir}/{fill(path, runtime)}"
+
+    paths = {p.name: at(p.path or f"inputs/{p.name}") for p in tool.inputs if p.name in staged}
+    values = {**runtime, **{p.name: None for p in tool.inputs if p.type in FILE_TYPES}, **paths}
+    in_artifacts = [{"name": k8s_name(name), "path": path} for name, path in paths.items()]
+    in_artifacts += [{"name": f"file-{n}", "path": at(path), "raw": {"data": content}}
+                     for n, (path, content) in enumerate(tool.files.items())]
+
+    command = tool.command if tool.command is not None else (entrypoint(tool.image) if entrypoint else None)
+    container: dict = {"image": tool.image}
+    if command:
+        container["command"] = list(command)
+    container["args"] = tool.argv(values)
+    container["workingDir"] = tool.workdir
+    if tool.env:
+        container["env"] = [{"name": k, "value": fill(v, values)} for k, v in tool.env.items()]
+    container["resources"] = {"requests": {"cpu": fill("{cpu}", values), "memory": f"{tool.ram_mb}Mi"}}
+    container["volumeMounts"] = [{"name": "work", "mountPath": tool.workdir}]
+
+    return {
+        "name": f"step-{step.name}",
+        "inputs": {"artifacts": in_artifacts},
+        "outputs": {"artifacts": [{"name": k8s_name(p.name), "path": at(p.path)}
+                                  for p in tool.outputs if p.type in FILE_TYPES]},
+        "volumes": [{"name": "work", "emptyDir": {}}],
+        "container": container,
+    }
+
+
+def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scalar],
+           entrypoint: Entrypoint | None = None) -> dict:
+    """An Argo Workflow that runs `pipeline` once with `inputs`.
+
+    `legos` must contain the steps' tools (registry.check has passed on them). `entrypoint(image)`
+    gives the ENTRYPOINT of images whose tool leaves `command` empty.
+    """
+    tools = {(x.id, x.version): x for x in legos if isinstance(x, ToolLego)}
+    values = pipeline_values(pipeline, inputs)
+    steps = {s.name: s for s in pipeline.steps}
+    templates, tasks = [], []
+    for name in pipeline.order():
+        step = steps[name]
+        tool = tools.get(step.tool.key())
+        if tool is None:
+            raise UnsupportedForArgo(f"step {name}: {step.tool.id}@{step.tool.version} is not a registered tool")
+        if "argo" not in tool.runs_on:
+            raise UnsupportedForArgo(f"step {name}: {tool.id} does not run on argo")
+        scalars, artifacts = task_inputs(step, tool, values)
+        templates.append(container_template(step, tool, scalars, artifacts, entrypoint))
+        task: dict = {"name": name, "template": f"step-{name}"}
+        deps = sorted({src.step for src in step.inputs.values() if isinstance(src, Link)})
+        if deps:
+            task["dependencies"] = deps
+        if artifacts:
+            task["arguments"] = {"artifacts": [{"name": k8s_name(n), **src} for n, src in artifacts.items()]}
+        tasks.append(task)
+
+    outputs = {out: f"{link.step}/{k8s_name(link.output)}" for out, link in pipeline.outputs.items()}
+    return {
+        "apiVersion": "argoproj.io/v1alpha1",
+        "kind": "Workflow",
+        "metadata": {
+            "generateName": f"{pipeline.id}-",
+            "labels": {"hydrowf/pipeline": pipeline.id, "hydrowf/version": pipeline.version},
+            "annotations": {"hydrowf/outputs": json.dumps(outputs)},      # pipeline output -> task/artifact
+        },
+        "spec": {"entrypoint": "main", "templates": [{"name": "main", "dag": {"tasks": tasks}}] + templates},
+    }
