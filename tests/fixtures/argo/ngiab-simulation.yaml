@@ -8,7 +8,7 @@ metadata:
     hydrowf/pipeline: ngiab-simulation
     hydrowf/version: 0.1.0
   annotations:
-    hydrowf/outputs: '{"run": "run/ngen-run"}'
+    hydrowf/outputs: '{"run": "run/ngen-run", "cng": "to-cng/cng"}'
 spec:
   entrypoint: main
   templates:
@@ -30,6 +30,14 @@ spec:
           artifacts:
           - name: ngen-run
             from: '{{tasks.preprocess.outputs.artifacts.ngen-run}}'
+      - name: to-cng
+        template: step-to-cng
+        dependencies:
+        - run
+        arguments:
+          artifacts:
+          - name: ngen-run
+            from: '{{tasks.run.outputs.artifacts.ngen-run}}'
   - name: step-preprocess
     inputs:
       artifacts:
@@ -106,6 +114,39 @@ spec:
       resources:
         requests:
           cpu: '4'
+          memory: 2048Mi
+      volumeMounts:
+      - name: work
+        mountPath: /work
+  - name: step-to-cng
+    inputs:
+      artifacts:
+      - name: ngen-run
+        path: /work/ngen-run
+    outputs:
+      artifacts:
+      - name: cng
+        path: /work/ngen-run_cng
+    volumes:
+    - name: work
+      emptyDir: {}
+    container:
+      image: hydrowf/ngiab-to-cng:0.1.0
+      command:
+      - python
+      - /app/ngiab_to_cng.py
+      args:
+      - /work/ngen-run
+      - --output
+      - /work/ngen-run_cng
+      - --run-id
+      - '{{workflow.name}}'
+      - --configuration-name
+      - ngiab_cfe_default
+      workingDir: /work
+      resources:
+        requests:
+          cpu: '1'
           memory: 2048Mi
       volumeMounts:
       - name: work

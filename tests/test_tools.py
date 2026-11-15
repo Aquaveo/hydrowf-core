@@ -38,6 +38,10 @@ def values(tool, **given):
     ({**TOOL, "inputs": [port("f", "file", data="d", default="x")]}, "file port can't take a constant"),
     ({**TOOL, "inputs": [port("n", "int", default="6")]}, "'6' is not a int"),
     ({**TOOL, "inputs": [port("s", "enum", symbols=["a"], default="b")]}, "'b' is not one of"),
+    ({**TOOL, "outputs": [port("o", "file", data="d", path="{run}.txt")]},
+     r"\{run\} is only known when the run starts"),
+    ({**TOOL, "files": {"{run}/marker": ""}}, r"files .*\{run\} is only known when the run starts"),
+    ({**TOOL, "files": {"{nope}/marker": ""}}, r"files .*\{nope\} is not an input"),
 ])
 def test_invalid_tools_are_rejected(bad, message):
     with pytest.raises(ValidationError, match=message):
@@ -48,6 +52,7 @@ def test_invalid_tools_are_rejected(bad, message):
     {**TOOL, "inputs": [port("n", "int", optional=True, default=1)], "args": ["{n}"]},     # default: always set
     {**TOOL, "inputs": [port("m", optional=True)], "args": [{"when": "m", "args": ["--m", "{m}"]}]},
     {**TOOL, "args": ["{workdir}/out", "{cpu}"]},                                           # no command: ENTRYPOINT
+    {**TOOL, "args": ["--id", "{run}"], "env": {"RUN": "{run}"}},                           # {run}: args and env
 ])
 def test_valid_tools_pass(good):
     LEGOS.validate_python([good])

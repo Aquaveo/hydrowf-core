@@ -37,6 +37,11 @@ def test_inputs_reach_the_command_line_and_artifacts():
                                                "s3": {"key": "inputs/hydrofabric/v2.2/conus_nextgen.gpkg"}}]
 
 
+def test_run_becomes_the_workflow_name():
+    args = template(simulation(), "step-to-cng")["container"]["args"]
+    assert args[args.index("--run-id") + 1] == "{{workflow.name}}"
+
+
 def test_without_an_entrypoint_argo_looks_it_up():
     run = template(simulation(entrypoint=None), "step-run")["container"]
     assert "command" not in run and run["args"][1:] == ["auto", "4", "local"]

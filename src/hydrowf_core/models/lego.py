@@ -210,7 +210,10 @@ RelPath = Annotated[str, _container_path(absolute=False)]
 AbsPath = Annotated[str, _container_path(absolute=True)]
 
 PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
-RUNTIME_NAMES = ("workdir", "cpu")      # placeholders the runtime fills, next to the input names
+# Placeholders the runtime fills, next to the input names. {run} is this run's id as the runtime
+# names it (Argo: the workflow name). It is only known when the run starts, so it can be used in
+# args and env, not in paths (which are fixed before the run has a name).
+RUNTIME_NAMES = ("workdir", "cpu", "run")
 
 
 def fill(text: str, values: dict[str, Scalar]) -> str:
@@ -272,7 +275,7 @@ class ToolLego(LegoBase):
     kind: Literal["tool"] = "tool"
     image: Annotated[str, Field(pattern=r"^[^:@\s]+(:[\w.\-]+|@sha256:[0-9a-f]{64})$")]  # pinned
     command: list[str] | None = None      # fixed words; None: the image's ENTRYPOINT
-    args: list[Union[str, ArgGroup]] = []  # "{name}" is an input's value, {workdir} or {cpu}
+    args: list[Union[str, ArgGroup]] = []  # "{name}" is an input's value, {workdir}, {cpu} or {run}
     inputs: list[Port] = []
     outputs: list[Port] = []
     workdir: AbsPath = "/work"            # also where relative paths start
@@ -300,8 +303,11 @@ class ToolLego(LegoBase):
             if PLACEHOLDER.search(word):
                 raise ValueError(f"command {word!r}: placeholders go in `args`, not `command`")
 
-        def check(text: str, where: str, group: str | None = None) -> None:
+        def check(text: str, where: str, group: str | None = None, in_path: bool = False) -> None:
             for name in PLACEHOLDER.findall(text):
+                if name == "run" and in_path:
+                    raise ValueError(f"{where} {text!r}: {{run}} is only known when the run starts; "
+                                     "use it in args or env, not in paths")
                 if name in RUNTIME_NAMES:
                     continue
                 port = inputs.get(name)
@@ -323,14 +329,16 @@ class ToolLego(LegoBase):
             check(value, f"env {key}")
         for port in self.inputs + self.outputs:
             if port.path:
-                check(port.path, f"{port.name} path")
+                check(port.path, f"{port.name} path", in_path=True)
+        for path in self.files:
+            check(path, "files", in_path=True)
         return self
 
     def argv(self, values: dict[str, Scalar | None]) -> list[str]:
         """The container's arguments for one run.
 
         `values` has every input name (defaults already applied; unset optional inputs as None;
-        file/directory inputs as their absolute paths) plus "workdir" and "cpu". Plain words are
+        file/directory inputs as their absolute paths) plus "workdir", "cpu" and "run". Plain words are
         filled with `fill`; an ArgGroup's words are added (filled) only when values[group.when]
         is neither None nor False.
         """
