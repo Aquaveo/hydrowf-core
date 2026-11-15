@@ -192,11 +192,14 @@
     - {name: start_date, type: string}
     - {name: end_date, type: string}
     - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
+       description: "without it, the preprocessor builds the graph from the gpkg"}
   steps:
     - name: preprocess
       tool: {id: ngiab-preprocess, version: 4.9.5}
       inputs:
         hydrofabric: {input: hydrofabric}
+        hydrofabric_graph: {input: hydrofabric_graph}
         feature: {input: feature}
         start_date: {input: start_date}
         end_date: {input: end_date}
