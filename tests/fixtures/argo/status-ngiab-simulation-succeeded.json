@@ -1,0 +1,74 @@
+{
+ "metadata": {
+  "name": "ngiab-simulation-rgbl4",
+  "namespace": "argo",
+  "annotations": {
+   "hydrowf/outputs": "{\"run\": \"run/ngen-run\"}"
+  }
+ },
+ "status": {
+  "phase": "Succeeded",
+  "nodes": {
+   "ngiab-simulation-rgbl4": {
+    "id": "ngiab-simulation-rgbl4",
+    "name": "ngiab-simulation-rgbl4",
+    "displayName": "ngiab-simulation-rgbl4",
+    "type": "DAG",
+    "phase": "Succeeded",
+    "templateName": "main"
+   },
+   "ngiab-simulation-rgbl4-3868047524": {
+    "id": "ngiab-simulation-rgbl4-3868047524",
+    "name": "ngiab-simulation-rgbl4.preprocess",
+    "displayName": "preprocess",
+    "type": "Pod",
+    "phase": "Succeeded",
+    "templateName": "step-preprocess",
+    "outputs": {
+     "artifacts": [
+      {
+       "name": "ngen-run",
+       "path": "/work/ngen-run",
+       "s3": {
+        "key": "ngiab-simulation-rgbl4/ngiab-simulation-rgbl4-step-preprocess-3868047524/ngen-run.tgz"
+       }
+      },
+      {
+       "name": "main-logs",
+       "s3": {
+        "key": "ngiab-simulation-rgbl4/ngiab-simulation-rgbl4-step-preprocess-3868047524/main.log"
+       }
+      }
+     ],
+     "exitCode": "0"
+    }
+   },
+   "ngiab-simulation-rgbl4-432766967": {
+    "id": "ngiab-simulation-rgbl4-432766967",
+    "name": "ngiab-simulation-rgbl4.run",
+    "displayName": "run",
+    "type": "Pod",
+    "phase": "Succeeded",
+    "templateName": "step-run",
+    "outputs": {
+     "artifacts": [
+      {
+       "name": "ngen-run",
+       "path": "/work/ngen-run",
+       "s3": {
+        "key": "ngiab-simulation-rgbl4/ngiab-simulation-rgbl4-step-run-432766967/ngen-run.tgz"
+       }
+      },
+      {
+       "name": "main-logs",
+       "s3": {
+        "key": "ngiab-simulation-rgbl4/ngiab-simulation-rgbl4-step-run-432766967/main.log"
+       }
+      }
+     ],
+     "exitCode": "0"
+    }
+   }
+  }
+ }
+}
