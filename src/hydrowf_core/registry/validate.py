@@ -5,6 +5,7 @@ The models validate each lego on its own. What needs other legos is here:
 - a pipeline step's tool exists (at the pinned version) and is a tool
 - every step input is a port of that tool; every required port is given
 - each source fits its port: same kind (scalar type, file, directory, dataset) and same data lego id
+  (an input with a default may stay unconnected)
 
 Returns a list of problems instead of raising on the first one, so a form can show them all.
 """
@@ -13,10 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from hydrowf_core.models.lego import (DataLego, DataSource, Lego, Link, Pipeline, PipelineInput, Port, ToolLego,
-                                      Value)
-
-# Python types a constant may have for each scalar port type (bool is an int in Python: keep it apart).
-VALUE_TYPES = {"string": (str,), "enum": (str,), "int": (int,), "float": (int, float), "boolean": (bool,)}
+                                      Value, value_problem)
 
 
 def check(legos: Iterable[Lego]) -> list[str]:
@@ -58,7 +56,7 @@ def check_pipeline(p: Pipeline, by_key: dict[tuple[str, str], Lego]) -> list[str
         for name, port in ports.items():
             src = s.inputs.get(name)
             if src is None:
-                if not port.optional:
+                if not port.optional and port.default is None:
                     problems.append(f"{where}: step {s.name}: required input {name!r} is not connected")
                 continue
             problem = source_problem(port, src, pipeline_inputs, tools, by_key)
@@ -77,16 +75,7 @@ def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
                    by_key: dict[tuple[str, str], Lego]) -> str | None:
     """Why `src` can't feed `port`, or None if it can."""
     if isinstance(src, Value):
-        allowed = VALUE_TYPES.get(port.type)
-        if allowed is None:
-            return f"a {port.type} port can't take a constant"
-        if isinstance(src.value, bool) and bool not in allowed:
-            return f"{src.value!r} is a boolean, the port is {port.type}"
-        if not isinstance(src.value, allowed):
-            return f"{src.value!r} is not a {port.type}"
-        if port.type == "enum" and src.value not in port.symbols:
-            return f"{src.value!r} is not one of {port.symbols}"
-        return None
+        return value_problem(port.type, port.symbols, src.value)
     if isinstance(src, DataSource):
         data = by_key.get(src.data.key())
         if not isinstance(data, DataLego):

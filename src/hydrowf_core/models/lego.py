@@ -1,7 +1,7 @@
 """hydrowf lego models (design sketch, pydantic v2).
 
 Two lego types live in one registry:
-- ToolLego: compute (image + command + typed ports)
+- ToolLego: compute (image + args + typed ports)
 - DataLego: a dataset (external read-only, managed by the platform, or a run output)
 
 A Port of type file/directory names the DataLego id it carries, so the canvas only connects
@@ -14,11 +14,12 @@ data-authors create managed data and deploy tools; anyone may add external data)
 """
 from __future__ import annotations
 
+import re
 from enum import Enum
 from graphlib import CycleError, TopologicalSorter
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 LegoId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9.\-]*$", max_length=63)]
 SemVer = Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
@@ -173,12 +174,62 @@ class DataLego(LegoBase):
 
 SCALAR_TYPES = ("string", "int", "float", "boolean", "enum")
 DATA_TYPES = ("file", "directory", "dataset")
+Scalar = Union[str, int, float, bool]
+
+# Python types a constant may have for each scalar port type (bool is an int in Python: keep it apart).
+VALUE_TYPES = {"string": (str,), "enum": (str,), "int": (int,), "float": (int, float), "boolean": (bool,)}
+
+
+def value_problem(port_type: str, symbols: list[str], value: Scalar) -> str | None:
+    """Why `value` can't be a constant for a port of `port_type`, or None if it can."""
+    allowed = VALUE_TYPES.get(port_type)
+    if allowed is None:
+        return f"a {port_type} port can't take a constant"
+    if isinstance(value, bool) and bool not in allowed:
+        return f"{value!r} is a boolean, the port is {port_type}"
+    if not isinstance(value, allowed):
+        return f"{value!r} is not a {port_type}"
+    if port_type == "enum" and value not in symbols:
+        return f"{value!r} is not one of {symbols}"
+    return None
+
+
+def _container_path(absolute: bool):
+    """Paths inside the container: relative ones sit under the tool's workdir. Never "..", so a
+    staged input can't land outside it (pydantic's regex engine has no look-ahead, hence a function)."""
+    def check(path: str) -> str:
+        if not path or path.startswith("/") != absolute:
+            raise ValueError(f"{path!r}: must be {'an absolute' if absolute else 'a relative'} path")
+        if ".." in path.split("/"):
+            raise ValueError(f"{path!r}: '..' is not allowed")
+        return path
+    return AfterValidator(check)
+
+
+RelPath = Annotated[str, _container_path(absolute=False)]
+AbsPath = Annotated[str, _container_path(absolute=True)]
+
+PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+RUNTIME_NAMES = ("workdir", "cpu")      # placeholders the runtime fills, next to the input names
+
+
+def fill(text: str, values: dict[str, Scalar]) -> str:
+    """Replace each {name} in `text` with values[name] (booleans as true/false, 4.0 as 4)."""
+    def one(match: re.Match) -> str:
+        value = values[match.group(1)]
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    return PLACEHOLDER.sub(one, text)
 
 
 class Port(Strict):
     """An input or output of a tool or pipeline.
 
-    file/directory: bytes the runtime moves through S3 (Argo artifacts).
+    file/directory: bytes the runtime moves through S3 (Argo artifacts); `path` says where they sit
+    under the tool's workdir (inputs default to inputs/<name>; outputs must say).
     dataset: a reference to a stored dataset (Iceberg table, STAC collection, external URL) that
     the tool reads in place; nothing is copied.
     """
@@ -187,6 +238,8 @@ class Port(Strict):
     data: LegoId | None = None            # file/directory/dataset: the DataLego id this port carries
     symbols: list[str] = []               # enum only
     optional: bool = False
+    default: Scalar | None = None         # scalars: used when a step leaves the input unconnected
+    path: RelPath | None = None           # file/directory: may use {input} placeholders
     description: str = ""
 
     @model_validator(mode="after")
@@ -197,18 +250,98 @@ class Port(Strict):
             raise ValueError(f"port {self.name}: only file/directory/dataset ports carry `data`")
         if (self.type == "enum") != bool(self.symbols):
             raise ValueError(f"port {self.name}: `symbols` goes with type enum, and only with it")
+        if self.path is not None and self.type not in ("file", "directory"):
+            raise ValueError(f"port {self.name}: only file/directory ports have a `path`")
+        if self.default is not None:
+            problem = value_problem(self.type, self.symbols, self.default)
+            if problem:
+                raise ValueError(f"port {self.name}: default {problem}")
         return self
 
 
+class ArgGroup(Strict):
+    """Words added only when input `when` is set (not missing, not None, not false)."""
+    when: str
+    args: Annotated[list[str], Field(min_length=1)]
+
+
 class ToolLego(LegoBase):
+    """A container tool. The runtime stages file/directory inputs at their paths under `workdir`,
+    writes `files`, runs `command` (or the image's ENTRYPOINT) with `argv(...)`, then collects
+    file/directory outputs from their paths."""
     kind: Literal["tool"] = "tool"
     image: Annotated[str, Field(pattern=r"^[^:@\s]+(:[\w.\-]+|@sha256:[0-9a-f]{64})$")]  # pinned
-    command: list[str]                    # words; "{name}" is replaced by the input's value
+    command: list[str] | None = None      # fixed words; None: the image's ENTRYPOINT
+    args: list[Union[str, ArgGroup]] = []  # "{name}" is an input's value, {workdir} or {cpu}
     inputs: list[Port] = []
     outputs: list[Port] = []
+    workdir: AbsPath = "/work"            # also where relative paths start
+    env: dict[str, str] = {}              # values may use placeholders
+    files: dict[RelPath, str] = {}        # extra files under workdir (path -> content), e.g. markers
+    network: bool = False                 # the tool reads from the internet (public buckets, APIs)
     cpu: float = 1
     ram_mb: int = 1024
     runs_on: list[Literal["argo", "hpc"]] = ["argo", "hpc"]
+
+    @model_validator(mode="after")
+    def check_tool(self) -> ToolLego:
+        for side, ports in (("input", self.inputs), ("output", self.outputs)):
+            names = [p.name for p in ports]
+            if len(names) != len(set(names)):
+                raise ValueError(f"{side} names must be unique")
+        inputs = {p.name: p for p in self.inputs}
+        for name in RUNTIME_NAMES:
+            if name in inputs:
+                raise ValueError(f"input {name!r}: the name is reserved for the runtime")
+        for port in self.outputs:
+            if port.type in ("file", "directory") and port.path is None:
+                raise ValueError(f"output {port.name}: a {port.type} output needs a `path`")
+        for word in self.command or []:
+            if PLACEHOLDER.search(word):
+                raise ValueError(f"command {word!r}: placeholders go in `args`, not `command`")
+
+        def check(text: str, where: str, group: str | None = None) -> None:
+            for name in PLACEHOLDER.findall(text):
+                if name in RUNTIME_NAMES:
+                    continue
+                port = inputs.get(name)
+                if port is None:
+                    raise ValueError(f"{where} {text!r}: {{{name}}} is not an input")
+                if port.optional and port.default is None and name != group:
+                    raise ValueError(f"{where} {text!r}: {{{name}}} is optional; "
+                                     f"put it in a group with when: {name}")
+
+        for arg in self.args:
+            if isinstance(arg, ArgGroup):
+                if arg.when not in inputs:
+                    raise ValueError(f"args group: when {arg.when!r} is not an input")
+                for word in arg.args:
+                    check(word, "args", group=arg.when)
+            else:
+                check(arg, "args")
+        for key, value in self.env.items():
+            check(value, f"env {key}")
+        for port in self.inputs + self.outputs:
+            if port.path:
+                check(port.path, f"{port.name} path")
+        return self
+
+    def argv(self, values: dict[str, Scalar | None]) -> list[str]:
+        """The container's arguments for one run.
+
+        `values` has every input name (defaults already applied; unset optional inputs as None;
+        file/directory inputs as their absolute paths) plus "workdir" and "cpu". Plain words are
+        filled with `fill`; an ArgGroup's words are added (filled) only when values[group.when]
+        is neither None nor False.
+        """
+        argv: list[str] = []
+        for arg in self.args:
+            if isinstance(arg, ArgGroup):
+                if values.get(arg.when) not in (None, False):     # `is not`: 0 and "" still count as set
+                    argv += [fill(word, values) for word in arg.args]
+            else:
+                argv.append(fill(arg, values))
+        return argv
 
 
 # ------------------------------------------------------------------ pipelines

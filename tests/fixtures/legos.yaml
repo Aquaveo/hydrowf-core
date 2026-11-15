@@ -60,18 +60,26 @@
   version: 0.1.0
   title: Hydrofabric subset (upstream of a gage)
   image: ghcr.io/example/hydrofabric-subset:0.1.0
-  command: [hydrofabric-subset, --id, "{outlet}", --out, region.gpkg]
+  command: [hydrofabric-subset]
+  args: [--id, "{outlet}", --out, "{workdir}/region.gpkg"]
   inputs:
     - {name: hydrofabric, type: dataset, data: hydrofabric-v2.2}
     - {name: outlet, type: string, description: "gage-… or cat-…"}
   outputs:
-    - {name: region, type: file, data: hydrofabric-gpkg}
+    - {name: region, type: file, data: hydrofabric-gpkg, path: region.gpkg}
   runs_on: [argo]
 
 - kind: data
   id: hydrofabric-gpkg
   version: 1.0.0
-  title: Hydrofabric subset as a GeoPackage (ngen layout)
+  title: Hydrofabric as a GeoPackage (ngen layout)
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+- kind: data
+  id: hydrofabric-graph
+  version: 1.0.0
+  title: Hydrofabric network graph (igraph pickle)
   data_kind: output
   storage: {driver: stac, format: other}
 
@@ -82,20 +90,73 @@
   data_kind: output
   storage: {driver: stac, format: other}
 
+# From hydrowf-tools nextgen/ngiab-preprocess/ngiab-preprocess.cwl (the spec it was copied from).
 - kind: tool
   id: ngiab-preprocess
   version: 4.9.5
   title: NGIAB data preprocess
-  image: ghcr.io/example/ngiab-preprocess:4.9.5
-  command: [cli, -i, "{outlet}", --start_date, "{start}", --end_date, "{end}", --source, "{source}"]
+  image: hydrowf/ngiab-preprocess:4.9.5.dev2-02c4145
+  command: [cli]
+  # The preprocessor reads the hydrofabric from ~/.ngiab/hydrofabric/v2.2/, so HOME is the workdir.
+  env: {HOME: "{workdir}"}
+  files: {.ngiab/hydrofabric/v2.2/no_update: ""}       # stops validate_hydrofabric() from prompting
+  network: true                                         # forcings come from public S3 buckets
+  args:
+    - --output_root
+    - "{workdir}"
+    - -o
+    - "{workdir}/{run_name}"
+    - -s
+    - -f
+    - -r
+    - -i
+    - "{feature}"
+    - --start_date
+    - "{start_date}"
+    - --end_date
+    - "{end_date}"
+    - {when: model, args: ["--{model}"]}
+    - --source
+    - "{source}"
+    - --subset_type
+    - "{subset_type}"
+    - {when: nwm_gw, args: [--nwm_gw]}
+    - --precip_max_gap
+    - "{precip_max_gap}"
   inputs:
-    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
-    - {name: outlet, type: string}
-    - {name: start, type: string}
-    - {name: end, type: string}
-    - {name: source, type: enum, symbols: [nwm, aorc], optional: true}
+    - {name: feature, type: string, description: "cat-5173 or gage-01646500"}
+    - {name: start_date, type: string}
+    - {name: end_date, type: string}
+    - {name: model, type: enum, symbols: [lstm, lstm_rust, dhbv2, dhbv2_daily, summa, snow17, sacsma],
+       optional: true, description: "empty = CFE + NOAH-OWP"}
+    - {name: source, type: enum, symbols: [nwm, aorc], default: nwm}
+    - {name: subset_type, type: enum, symbols: [nexus, catchment], default: nexus}
+    - {name: nwm_gw, type: boolean, default: false}
+    - {name: precip_max_gap, type: int, default: 6}
+    - {name: run_name, type: string, default: ngen-run}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg,
+       path: .ngiab/hydrofabric/v2.2/conus_nextgen.gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
+       path: .ngiab/hydrofabric/v2.2/conus_igraph_network.gpickle}
   outputs:
-    - {name: run, type: directory, data: ngen-run}
+    - {name: ngen_run, type: directory, data: ngen-run, path: "{run_name}"}
+  cpu: 4
+  ram_mb: 16384
+
+# From hydrowf-tools nextgen/ngiab-run/ngiab-run.cwl. No command: the image's ENTRYPOINT
+# (/ngen/HelloNGEN.sh) takes <run dir> auto <procs> local.
+- kind: tool
+  id: ngiab-run
+  version: 2.1.0
+  title: NextGen run (NGIAB)
+  image: awiciroh/ciroh-ngen-image@sha256:d5ee1a6c15c025f9be2f9ce140dd9cdc2e933bc30f531a41f180d45b15c8ab17
+  args: ["{ngen_run}", auto, "{cpu}", local]
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+  outputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}   # same folder, outputs/ filled in
+  cpu: 4
+  ram_mb: 2048
 
 - kind: pipeline
   id: ngiab-prepare
@@ -115,9 +176,33 @@
       tool: {id: ngiab-preprocess, version: 4.9.5}
       inputs:
         hydrofabric: {step: subset, output: region}
-        outlet: {input: outlet}
-        start: {input: start}
-        end: {input: end}
+        feature: {input: outlet}
+        start_date: {input: start}
+        end_date: {input: end}
         source: {value: nwm}
   outputs:
-    run: {step: preprocess, output: run}
+    run: {step: preprocess, output: ngen_run}
+
+- kind: pipeline
+  id: ngiab-simulation
+  version: 0.1.0
+  title: Preprocess, then run NextGen
+  inputs:
+    - {name: feature, type: string}
+    - {name: start_date, type: string}
+    - {name: end_date, type: string}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+  steps:
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {input: hydrofabric}
+        feature: {input: feature}
+        start_date: {input: start_date}
+        end_date: {input: end_date}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: preprocess, output: ngen_run}
+  outputs:
+    run: {step: run, output: ngen_run}

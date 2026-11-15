@@ -20,8 +20,8 @@ def table(columns, partition=(), sort=()):
 
 def test_fixture_legos_validate():
     legos = LEGOS.validate_python(yaml.safe_load((FIXTURES / "legos.yaml").read_text()))
-    assert [type(x).__name__ for x in legos].count("DataLego") == 6
-    assert [x.id for x in legos if isinstance(x, ToolLego)] == ["hydrofabric-subset", "ngiab-preprocess"]
+    assert [type(x).__name__ for x in legos].count("DataLego") == 7
+    assert [x.id for x in legos if isinstance(x, ToolLego)] == ["hydrofabric-subset", "ngiab-preprocess", "ngiab-run"]
     assert not isinstance(legos[-1], (DataLego, ToolLego))   # the pipeline
 
 

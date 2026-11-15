@@ -48,8 +48,8 @@ def test_bad_wiring_is_rejected(change, message):
 
 
 @pytest.mark.parametrize("change", [
-    lambda p: step(p, "subset")["inputs"].update(outlet={"step": "preprocess", "output": "run"}),   # a <-> b
-    lambda p: step(p, "subset")["inputs"].update(outlet={"step": "subset", "output": "region"}),    # self
+    lambda p: step(p, "subset")["inputs"].update(outlet={"step": "preprocess", "output": "ngen_run"}),   # a <-> b
+    lambda p: step(p, "subset")["inputs"].update(feature={"step": "subset", "output": "region"}),    # self
 ])
 def test_cycles_are_rejected(change):
     raw, p = registry()
@@ -63,13 +63,13 @@ def test_cycles_are_rejected(change):
 @pytest.mark.parametrize("change, message", [
     (lambda p: step(p, "subset").update(tool={"id": "hydrofabric-subset", "version": "9.9.9"}),
      "hydrofabric-subset@9.9.9 is not a registered tool"),
-    (lambda p: step(p, "preprocess")["inputs"].pop("start"), "required input 'start' is not connected"),
+    (lambda p: step(p, "preprocess")["inputs"].pop("start_date"), "required input 'start_date' is not connected"),
     (lambda p: step(p, "preprocess")["inputs"].update(extra={"value": 1}), "has no input 'extra'"),
     (lambda p: step(p, "preprocess")["inputs"].update(source={"value": "daymet"}), "not one of"),
-    (lambda p: step(p, "preprocess")["inputs"].update(outlet={"value": 5}), "5 is not a string"),
+    (lambda p: step(p, "preprocess")["inputs"].update(feature={"value": 5}), "5 is not a string"),
     (lambda p: step(p, "preprocess")["inputs"].update(hydrofabric={"step": "subset", "output": "nope"}),
      "has no output 'nope'"),
-    (lambda p: step(p, "preprocess")["inputs"].update(outlet={"step": "subset", "output": "region"}),
+    (lambda p: step(p, "preprocess")["inputs"].update(feature={"step": "subset", "output": "region"}),
      "subset.region is file of hydrofabric-gpkg, the port wants string"),
     (lambda p: step(p, "preprocess")["inputs"].update(
         hydrofabric={"data": {"id": "hydrofabric-v2.2", "version": "1.0.0"}}),
@@ -85,6 +85,6 @@ def test_registry_check_reports_mismatches(change, message):
 
 def test_unknown_data_lego_on_a_tool_port_is_reported():
     raw, _ = registry()
-    raw = [x for x in raw if x.get("id") != "ngen-run"]
+    raw = [x for x in raw if x.get("id") != "hydrofabric-graph"]
     assert check(LEGOS.validate_python(raw)) == [
-        "tool ngiab-preprocess@4.9.5: port run: unknown data lego 'ngen-run'"]
+        "tool ngiab-preprocess@4.9.5: port hydrofabric_graph: unknown data lego 'hydrofabric-graph'"]
