@@ -158,6 +158,38 @@
   cpu: 4
   ram_mb: 2048
 
+- kind: data
+  id: ngen-cng
+  version: 1.0.0
+  title: NGIAB run as cloud-native files (Parquet, Zarr, COG, manifest.json)
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+# From hydrowf-tools nextgen/ngiab-to-cng/ngiab-to-cng.cwl. The image is only built locally, so
+# `command` repeats its ENTRYPOINT: Argo's emissary asks the registry otherwise, and a registry
+# can't describe a local image (hydrowf-platform docs/argo-findings.md).
+- kind: tool
+  id: ngiab-to-cng
+  version: 0.1.0
+  title: NGIAB run to cloud-native files
+  image: hydrowf/ngiab-to-cng:0.1.0
+  command: [python, /app/ngiab_to_cng.py]
+  args:
+    - "{ngen_run}"
+    - --output
+    - "{workdir}/ngen-run_cng"
+    - {when: run_id, args: [--run-id, "{run_id}"]}
+    - --configuration-name
+    - "{configuration_name}"
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+    - {name: run_id, type: string, optional: true, description: "empty = the run folder name"}
+    - {name: configuration_name, type: string, default: ngiab, description: TEEHR configuration name}
+  outputs:
+    - {name: cng, type: directory, data: ngen-cng, path: ngen-run_cng}
+  cpu: 1
+  ram_mb: 2048
+
 - kind: pipeline
   id: ngiab-prepare
   version: 0.1.0
@@ -186,7 +218,7 @@
 - kind: pipeline
   id: ngiab-simulation
   version: 0.1.0
-  title: Preprocess, then run NextGen
+  title: Preprocess, run NextGen, convert to cloud-native files
   inputs:
     - {name: feature, type: string}
     - {name: start_date, type: string}
@@ -194,6 +226,7 @@
     - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
     - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
        description: "without it, the preprocessor builds the graph from the gpkg"}
+    - {name: configuration_name, type: string, default: ngiab_cfe_default}
   steps:
     - name: preprocess
       tool: {id: ngiab-preprocess, version: 4.9.5}
@@ -207,5 +240,11 @@
       tool: {id: ngiab-run, version: 2.1.0}
       inputs:
         ngen_run: {step: preprocess, output: ngen_run}
+    - name: to-cng
+      tool: {id: ngiab-to-cng, version: 0.1.0}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
   outputs:
     run: {step: run, output: ngen_run}
+    cng: {step: to-cng, output: cng}
