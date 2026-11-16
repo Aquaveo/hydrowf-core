@@ -5,6 +5,7 @@ The stub answers get_workflow with a response recorded from a real run on Argo v
 """
 import copy
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -18,14 +19,24 @@ NAME = SUCCEEDED["metadata"]["name"]
 
 
 class StubService:
-    """Answers get_workflow from a recorded response; keeps every create request."""
+    """Answers get_workflow and list_workflows from recorded responses; keeps every create, list and
+    delete request."""
 
-    def __init__(self, workflow):
+    def __init__(self, workflow, listed=()):
         self.workflow = workflow
-        self.created = []
+        self.listed = list(listed)
+        self.created, self.list_calls, self.deleted = [], [], []
 
     def get_workflow(self, name, namespace=None):
         return m.Workflow.model_validate({"spec": {}, **self.workflow})    # the fixture keeps no spec
+
+    def list_workflows(self, namespace=None, label_selector=None, **_):
+        self.list_calls.append((namespace, label_selector))
+        return m.WorkflowList(metadata=m.ListMeta(),
+                              items=[m.Workflow.model_validate({"spec": {}, **w}) for w in self.listed])
+
+    def delete_workflow(self, name, namespace=None, **_):
+        self.deleted.append((name, namespace))
 
     def create_workflow(self, req, namespace=None):
         self.created.append((req, namespace))
@@ -33,8 +44,13 @@ class StubService:
                           spec=req.workflow.spec)
 
 
-def runtime(workflow=SUCCEEDED):
-    return ArgoRuntime("https://unused", bucket="my-bucket", service=StubService(copy.deepcopy(workflow)))
+def runtime(workflow=SUCCEEDED, listed=()):
+    return ArgoRuntime("https://unused", bucket="my-bucket",
+                       service=StubService(copy.deepcopy(workflow), copy.deepcopy(list(listed))))
+
+
+def at(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
 def while_run_is(phase):
@@ -59,7 +75,10 @@ def test_submit_sends_the_rendered_workflow_unchanged():
 
 def test_status_of_a_finished_run():
     status = runtime().status(NAME)
-    assert status == RunStatus(NAME, "Succeeded", "", {"preprocess": "Succeeded", "run": "Succeeded"})
+    assert status == RunStatus(NAME, "Succeeded", "", {"preprocess": "Succeeded", "run": "Succeeded"},
+                               pipeline="ngiab-simulation", created_at=at("2026-11-15T00:29:58Z"),
+                               started_at=at("2026-11-15T00:29:58Z"), finished_at=at("2026-11-15T00:40:15Z"),
+                               progress="2/2")
     assert status.finished
 
 
@@ -71,7 +90,8 @@ def test_status_while_running():
 
 def test_status_before_the_controller_sees_it():
     wf = {k: v for k, v in SUCCEEDED.items() if k != "status"}
-    assert runtime(wf).status(NAME) == RunStatus(NAME, "Pending")
+    assert runtime(wf).status(NAME) == RunStatus(NAME, "Pending", pipeline="ngiab-simulation",
+                                                 created_at=at("2026-11-15T00:29:58Z"))
 
 
 def test_outputs_of_a_finished_run():
@@ -87,3 +107,41 @@ def test_no_outputs_without_the_annotation():
     wf = copy.deepcopy(SUCCEEDED)
     wf["metadata"]["annotations"] = {}
     assert runtime(wf).outputs(NAME) == {}
+
+
+def older_and_newer():
+    """Two recorded runs: the real one, and a copy created an hour later."""
+    newer = copy.deepcopy(SUCCEEDED)
+    newer["metadata"]["name"] = "ngiab-simulation-newer"
+    newer["metadata"]["creationTimestamp"] = "2026-11-15T01:29:58Z"
+    return [SUCCEEDED, newer]
+
+
+def test_list_returns_every_hydrowf_run_newest_first():
+    rt = runtime(listed=older_and_newer())
+    assert [r.name for r in rt.list()] == ["ngiab-simulation-newer", NAME]
+    assert rt.service.list_calls == [("argo", "hydrowf/pipeline")]      # label exists: render() made it
+
+
+def test_list_of_one_pipeline():
+    rt = runtime(listed=older_and_newer())
+    rt.list("ngiab-simulation")
+    assert rt.service.list_calls == [("argo", "hydrowf/pipeline=ngiab-simulation")]
+
+
+def test_list_items_carry_their_status():
+    [run] = runtime(listed=[SUCCEEDED]).list()
+    assert run == runtime().status(NAME)
+
+
+def test_delete_removes_the_workflow():
+    rt = runtime()
+    rt.delete(NAME)
+    assert rt.service.deleted == [(NAME, "argo")]
+
+
+def test_a_run_without_a_creation_time_sorts_last():
+    untimed = copy.deepcopy(SUCCEEDED)
+    untimed["metadata"]["name"] = "ngiab-simulation-untimed"
+    del untimed["metadata"]["creationTimestamp"]
+    assert [r.name for r in runtime(listed=[untimed, SUCCEEDED]).list()] == [NAME, "ngiab-simulation-untimed"]
