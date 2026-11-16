@@ -1,0 +1,45 @@
+{
+  "id": "ngiab-simulation",
+  "version": "0.1.0",
+  "title": "Preprocess, run NextGen, convert to cloud-native files",
+  "description": "",
+  "jobControlOptions": ["async-execute"],
+  "keywords": ["hydrowf", "pipeline"],
+  "inputs": {
+    "feature": {
+      "title": "feature", "description": "",
+      "schema": {"type": "string"}, "minOccurs": 1, "maxOccurs": 1
+    },
+    "start_date": {
+      "title": "start_date", "description": "",
+      "schema": {"type": "string"}, "minOccurs": 1, "maxOccurs": 1
+    },
+    "end_date": {
+      "title": "end_date", "description": "",
+      "schema": {"type": "string"}, "minOccurs": 1, "maxOccurs": 1
+    },
+    "hydrofabric": {
+      "title": "hydrofabric", "description": "(Hydrofabric as a GeoPackage (ngen layout))",
+      "schema": {"type": "string", "format": "uri", "pattern": "^s3://[^/]+/.+"}, "minOccurs": 1, "maxOccurs": 1
+    },
+    "hydrofabric_graph": {
+      "title": "hydrofabric_graph",
+      "description": "without it, the preprocessor builds the graph from the gpkg (Hydrofabric network graph (igraph pickle))",
+      "schema": {"type": "string", "format": "uri", "pattern": "^s3://[^/]+/.+"}, "minOccurs": 0, "maxOccurs": 1
+    },
+    "configuration_name": {
+      "title": "configuration_name", "description": "",
+      "schema": {"type": "string", "default": "ngiab_cfe_default"}, "minOccurs": 0, "maxOccurs": 1
+    }
+  },
+  "outputs": {
+    "run": {
+      "title": "run", "description": "(NGIAB run folder)",
+      "schema": {"type": "string", "format": "uri", "pattern": "^s3://[^/]+/.+"}
+    },
+    "cng": {
+      "title": "cng", "description": "(NGIAB run as cloud-native files (Parquet, Zarr, COG, manifest.json))",
+      "schema": {"type": "string", "format": "uri", "pattern": "^s3://[^/]+/.+"}
+    }
+  }
+}
