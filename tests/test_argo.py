@@ -42,6 +42,13 @@ def test_run_becomes_the_workflow_name():
     assert args[args.index("--run-id") + 1] == "{{workflow.name}}"
 
 
+def test_a_given_name_replaces_the_generated_one():
+    job = "1097b650-e1f9-11f1-8c4c-0c54150d835b"          # a pygeoapi job id (uuid1)
+    wf = render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get, name=job)
+    assert wf["metadata"]["name"] == job and "generateName" not in wf["metadata"]
+    assert simulation()["metadata"]["generateName"] == "ngiab-simulation-"
+
+
 def test_without_an_entrypoint_argo_looks_it_up():
     run = template(simulation(entrypoint=None), "step-run")["container"]
     assert "command" not in run and run["args"][1:] == ["auto", "4", "local"]

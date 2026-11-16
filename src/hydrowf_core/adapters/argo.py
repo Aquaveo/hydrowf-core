@@ -134,26 +134,28 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
 
 
 def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scalar],
-           entrypoint: Entrypoint | None = None) -> dict:
+           entrypoint: Entrypoint | None = None, name: str | None = None) -> dict:
     """An Argo Workflow that runs `pipeline` once with `inputs`.
 
     `legos` must contain the steps' tools (registry.check has passed on them). `entrypoint(image)`
-    gives the ENTRYPOINT of images whose tool leaves `command` empty.
+    gives the ENTRYPOINT of images whose tool leaves `command` empty. `name` names the workflow (the
+    caller's id for the run, e.g. a pygeoapi job id); without it Argo generates `<pipeline id>-xxxxx`.
+    Argo copies the name into a pod label, so keep it a DNS name of 63 characters or less.
     """
     tools = {(x.id, x.version): x for x in legos if isinstance(x, ToolLego)}
     values = pipeline_values(pipeline, inputs)
     steps = {s.name: s for s in pipeline.steps}
     templates, tasks = [], []
-    for name in pipeline.order():
-        step = steps[name]
+    for step_name in pipeline.order():
+        step = steps[step_name]
         tool = tools.get(step.tool.key())
         if tool is None:
-            raise UnsupportedForArgo(f"step {name}: {step.tool.id}@{step.tool.version} is not a registered tool")
+            raise UnsupportedForArgo(f"step {step_name}: {step.tool.id}@{step.tool.version} is not a registered tool")
         if "argo" not in tool.runs_on:
-            raise UnsupportedForArgo(f"step {name}: {tool.id} does not run on argo")
+            raise UnsupportedForArgo(f"step {step_name}: {tool.id} does not run on argo")
         scalars, artifacts = task_inputs(step, tool, values)
         templates.append(container_template(step, tool, scalars, artifacts, entrypoint))
-        task: dict = {"name": name, "template": f"step-{name}"}
+        task: dict = {"name": step_name, "template": f"step-{step_name}"}
         deps = sorted({src.step for src in step.inputs.values() if isinstance(src, Link)})
         if deps:
             task["dependencies"] = deps
@@ -166,7 +168,7 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
         "apiVersion": "argoproj.io/v1alpha1",
         "kind": "Workflow",
         "metadata": {
-            "generateName": f"{pipeline.id}-",
+            **({"name": name} if name else {"generateName": f"{pipeline.id}-"}),
             "labels": {"hydrowf/pipeline": pipeline.id, "hydrowf/version": pipeline.version},
             "annotations": {"hydrowf/outputs": json.dumps(outputs)},      # pipeline output -> task/artifact
         },
