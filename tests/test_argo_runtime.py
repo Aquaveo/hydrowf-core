@@ -73,6 +73,12 @@ def test_submit_sends_the_rendered_workflow_unchanged():
     assert request.workflow.model_dump(mode="json", by_alias=True, exclude_none=True) == workflow
 
 
+def with_plan(wf, *steps):
+    """`wf` with the spec render() writes: an entrypoint DAG `main` with one task per step."""
+    tasks = [{"name": step, "template": f"step-{step}"} for step in steps]
+    return {**wf, "spec": {"entrypoint": "main", "templates": [{"name": "main", "dag": {"tasks": tasks}}]}}
+
+
 def test_status_of_a_finished_run():
     status = runtime().status(NAME)
     assert status == RunStatus(NAME, "Succeeded", "", {"preprocess": "Succeeded", "run": "Succeeded"},
@@ -86,6 +92,23 @@ def test_status_while_running():
     status = runtime(while_run_is("Running")).status(NAME)
     assert (status.phase, status.steps, status.finished) == (
         "Running", {"preprocess": "Succeeded", "run": "Running"}, False)
+
+
+def test_progress_counts_every_planned_step():
+    # Argo's own progress counts only the nodes it has created: "1/2" while to-cng doesn't exist yet
+    wf = with_plan(while_run_is("Running"), "preprocess", "run", "to-cng")
+    wf["status"]["progress"] = "1/2"
+    assert runtime(wf).status(NAME).progress == "1/3"
+
+
+def test_progress_of_a_finished_run_is_the_whole_plan():
+    assert runtime(with_plan(SUCCEEDED, "preprocess", "run")).status(NAME).progress == "2/2"
+
+
+def test_progress_after_a_failed_step():
+    wf = with_plan(while_run_is("Failed"), "preprocess", "run", "to-cng")
+    wf["status"]["phase"] = "Failed"
+    assert runtime(wf).status(NAME).progress == "1/3"
 
 
 def test_status_before_the_controller_sees_it():

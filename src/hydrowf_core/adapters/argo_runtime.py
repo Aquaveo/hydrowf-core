@@ -19,6 +19,7 @@ from hera.workflows import WorkflowsService
 from hera.workflows import models as m
 
 FINISHED = ("Succeeded", "Failed", "Error")
+DONE = ("Succeeded", "Skipped", "Omitted")          # step phases that count toward progress
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,7 @@ class RunStatus:
     created_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
-    progress: str = ""                    # Argo's "<done>/<total>" steps, e.g. "2/3"
+    progress: str = ""                    # "<done>/<total>" of the planned steps, e.g. "2/3"
 
     @property
     def finished(self) -> bool:
@@ -97,6 +98,27 @@ def time(t: m.Time | None) -> datetime | None:
     return t.root if t is not None else None
 
 
+def plan(wf: m.Workflow) -> list[str]:
+    """The task names of the workflow's entrypoint DAG: every step render() planned, including the
+    ones Argo hasn't created a node for yet. [] for a workflow without a DAG entrypoint."""
+    spec = wf.spec
+    main = next((t for t in spec.templates or [] if t.name == spec.entrypoint), None) if spec else None
+    return [task.name for task in main.dag.tasks] if main and main.dag else []
+
+
+def progress(steps: dict[str, str], planned: list[str], argo_progress: str) -> str:
+    """Done over planned steps, as "<done>/<total>"; Argo's own progress when there is no plan.
+
+    `steps` is step name -> phase for the steps that have a node (run_status's `steps`). A step is
+    done when it did its work (Succeeded) or a `when:` condition left it out (Skipped, Omitted);
+    a Failed step is finished but not done.
+    """
+    if not planned:
+        return argo_progress
+    done = sum(steps.get(step) in DONE for step in planned)
+    return f"{done}/{len(planned)}"
+
+
 def run_status(wf: m.Workflow) -> RunStatus:
     """A RunStatus from one workflow (a get_workflow answer or a list_workflows item)."""
     meta, status = wf.metadata, wf.status
@@ -106,4 +128,4 @@ def run_status(wf: m.Workflow) -> RunStatus:
     steps = {n.display_name: n.phase or "Pending" for n in (status.nodes or {}).values() if n.type == "Pod"}
     return RunStatus(meta.name, status.phase or "Pending", status.message or "", steps, **common,
                      started_at=time(status.started_at), finished_at=time(status.finished_at),
-                     progress=status.progress or "")
+                     progress=progress(steps, plan(wf), status.progress or ""))
