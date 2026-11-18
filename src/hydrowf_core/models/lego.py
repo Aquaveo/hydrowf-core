@@ -180,8 +180,9 @@ Scalar = Union[str, int, float, bool]
 VALUE_TYPES = {"string": (str,), "enum": (str,), "int": (int,), "float": (int, float), "boolean": (bool,)}
 
 
-def value_problem(port_type: str, symbols: list[str], value: Scalar) -> str | None:
-    """Why `value` can't be a constant for a port of `port_type`, or None if it can."""
+def value_problem(port_type: str, symbols: list[str], value: Scalar, pattern: str | None = None) -> str | None:
+    """Why `value` can't be a value of a port of `port_type`, or None if it can. `pattern` must match
+    the whole of a string value."""
     allowed = VALUE_TYPES.get(port_type)
     if allowed is None:
         return f"a {port_type} port can't take a constant"
@@ -191,6 +192,8 @@ def value_problem(port_type: str, symbols: list[str], value: Scalar) -> str | No
         return f"{value!r} is not a {port_type}"
     if port_type == "enum" and value not in symbols:
         return f"{value!r} is not one of {symbols}"
+    if pattern is not None and not re.fullmatch(pattern, value, flags=re.ASCII):   # \d is 0-9, as in JSON Schema
+        return f"{value!r} does not match {pattern}"
     return None
 
 
@@ -240,6 +243,9 @@ class Port(Strict):
     type: Literal["string", "int", "float", "boolean", "enum", "file", "directory", "dataset"]
     data: LegoId | None = None            # file/directory/dataset: the DataLego id this port carries
     symbols: list[str] = []               # enum only
+    # string only: a regex the whole value must match. It is also the OGC schema's pattern, so keep to
+    # what Python and JSON Schema (ECMA-262) share: no named groups, inline flags or \Z
+    pattern: str | None = None
     optional: bool = False
     default: Scalar | None = None         # scalars: used when a step leaves the input unconnected
     path: RelPath | None = None           # file/directory: may use {input} placeholders
@@ -255,8 +261,15 @@ class Port(Strict):
             raise ValueError(f"port {self.name}: `symbols` goes with type enum, and only with it")
         if self.path is not None and self.type not in ("file", "directory"):
             raise ValueError(f"port {self.name}: only file/directory ports have a `path`")
+        if self.pattern is not None:
+            if self.type != "string":
+                raise ValueError(f"port {self.name}: only string ports have a `pattern`")
+            try:
+                re.compile(self.pattern, flags=re.ASCII)
+            except re.error as err:
+                raise ValueError(f"port {self.name}: pattern {self.pattern!r}: {err}") from err
         if self.default is not None:
-            problem = value_problem(self.type, self.symbols, self.default)
+            problem = value_problem(self.type, self.symbols, self.default, self.pattern)
             if problem:
                 raise ValueError(f"port {self.name}: default {problem}")
         return self

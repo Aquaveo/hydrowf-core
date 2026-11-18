@@ -23,6 +23,8 @@ def test_simulation_has_the_expected_description():
 @pytest.mark.parametrize("port, schema", [
     ({"name": "x", "type": "string"}, {"type": "string"}),
     ({"name": "x", "type": "string", "default": "a"}, {"type": "string", "default": "a"}),
+    ({"name": "x", "type": "string", "pattern": r"gage-\d+|cat-\d+"},
+     {"type": "string", "pattern": r"^(?:gage-\d+|cat-\d+)$"}),          # anchored: JSON Schema's aren't
     ({"name": "x", "type": "int", "default": 6}, {"type": "integer", "default": 6}),
     ({"name": "x", "type": "float"}, {"type": "number"}),
     ({"name": "x", "type": "boolean", "default": False}, {"type": "boolean", "default": False}),

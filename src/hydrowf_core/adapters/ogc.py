@@ -30,6 +30,8 @@ def port_schema(port: Port) -> dict:
             schema = {"type": "string", "format": "uri", "pattern": S3_URI}
         case Port(type=t) if t in JSON_TYPES:
             schema = {"type": JSON_TYPES[t]}
+            if port.pattern is not None:      # JSON Schema patterns aren't anchored; ours match whole values
+                schema["pattern"] = f"^(?:{port.pattern})$"
         case _:
             raise UnsupportedForOgc(f"port {port.name}: {port.type} ports need a data driver")
     if port.default is not None:          # False and 0 are real defaults
