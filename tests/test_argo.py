@@ -70,6 +70,87 @@ def test_bad_inputs_are_rejected_before_anything_is_rendered(inputs, message):
         simulation(inputs)
 
 
+@pytest.mark.parametrize("name, value", [
+    ("feature", "gage-{{=sprig.repeat(2, '.')}}"),     # an Argo expression: evaluated in the controller
+    ("feature", "gage-{{workflow.name}}"),             # an Argo variable
+    ("feature", "gage-{"),                             # half of one: it could join registry text after it
+    ("configuration_name", "x}"),
+    ("configuration_name", "$(HOME)"),                 # Kubernetes expands $(VAR) in args and env
+    ("configuration_name", "cfe$"),                    # half of one: "(HOME)" after it would complete it
+    ("configuration_name", "cfe\nx"),                  # a control character
+    ("hydrofabric", "s3://my-bucket/{{workflow.name}}/x.gpkg"),   # artifact keys are expanded too
+])
+def test_caller_text_with_template_syntax_is_rejected(name, value):
+    with pytest.raises(BadInputs, match=rf"input {name}: \{{, \}}, \$ and control characters are not allowed"):
+        simulation({**INPUTS, name: value})
+
+
+def test_caller_text_has_a_length_limit():
+    with pytest.raises(BadInputs, match="input configuration_name: longer than 1024 characters"):
+        simulation({**INPUTS, "configuration_name": "x" * 1025})
+
+
+def test_defaults_are_the_registrys_text_not_the_callers():
+    pipeline = PIPELINES["ngiab-simulation"]
+    inputs = [p.model_copy(update={"default": "{{workflow.name}}"}) if p.name == "configuration_name" else p
+              for p in pipeline.inputs]
+    workflow = render(pipeline.model_copy(update={"inputs": inputs}), LEGO_LIST, INPUTS, ENTRYPOINTS.get)
+    assert "{{workflow.name}}" in template(workflow, "step-to-cng")["container"]["args"]
+
+
+def with_pattern(name, pattern):
+    """ngiab-simulation with a pattern on one of its inputs."""
+    pipeline = PIPELINES["ngiab-simulation"]
+    inputs = [p.model_copy(update={"pattern": pattern}) if p.name == name else p for p in pipeline.inputs]
+    return pipeline.model_copy(update={"inputs": inputs})
+
+
+def test_a_tool_ports_pattern_holds_for_values_from_the_pipeline():
+    legos = [x.model_copy(update={"inputs": [p.model_copy(update={"pattern": "gage-[0-9]+"})
+                                             if p.name == "feature" else p for p in x.inputs]})
+             if x.id == "ngiab-preprocess" else x for x in LEGO_LIST]
+    render(PIPELINES["ngiab-simulation"], legos, INPUTS, ENTRYPOINTS.get)   # gage-01031510
+    with pytest.raises(BadInputs, match=r"input feature \(step preprocess.feature\): 'cat-5173' does not match"):
+        render(PIPELINES["ngiab-simulation"], legos, {**INPUTS, "feature": "cat-5173"}, ENTRYPOINTS.get)
+
+
+def tiny():
+    """A tool whose output path is an input, and a pipeline that hands that input to the caller."""
+    return LEGOS.validate_python([
+        {"kind": "tool", "id": "t", "version": "0.1.0", "title": "t", "image": "busybox:1.36",
+         "args": ["{name}"], "inputs": [{"name": "name", "type": "string"}],
+         "outputs": [{"name": "out", "type": "directory", "data": "d", "path": "{name}"}]},
+        {"kind": "pipeline", "id": "p", "version": "0.1.0", "title": "p",
+         "inputs": [{"name": "name", "type": "string"}],
+         "steps": [{"name": "s", "tool": {"id": "t", "version": "0.1.0"}, "inputs": {"name": {"input": "name"}}}],
+         "outputs": {"out": {"step": "s", "output": "out"}}},
+    ])
+
+
+@pytest.mark.parametrize("value", ["../../var/run/secrets/kubernetes.io/serviceaccount", "a/../../x", "/etc",
+                                   "a//b", "", "."])
+def test_a_path_an_input_fills_stays_under_the_workdir(value):
+    legos = tiny()
+    with pytest.raises(BadInputs, match="outside /work"):
+        render(legos[-1], legos, {"name": value})
+
+
+def test_a_path_an_input_fills_may_have_folders():
+    legos = tiny()
+    workflow = render(legos[-1], legos, {"name": "runs/ngen-run"})
+    assert template(workflow, "step-s")["outputs"]["artifacts"][0]["path"] == "/work/runs/ngen-run"
+
+
+def test_an_input_must_match_its_ports_pattern():
+    pipeline = with_pattern("start_date", r"\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?")
+    render(pipeline, LEGO_LIST, INPUTS, ENTRYPOINTS.get)                     # 2017-10-01 matches
+    render(pipeline, LEGO_LIST, {**INPUTS, "start_date": "2017-10-01 06:00"}, ENTRYPOINTS.get)
+    for bad in ("2017/10/01", "2017-10-01T06:00", "2017-10-01 06:00 junk",   # the whole value must match
+                "\u0662\u0660\u0661\u0667-\u0661\u0660-\u0660\u0661"):     # Arabic-Indic digits: \d is ASCII
+        with pytest.raises(BadInputs, match="input start_date: .* does not match"):
+            render(pipeline, LEGO_LIST, {**INPUTS, "start_date": bad}, ENTRYPOINTS.get)
+
+
 def test_caller_labels_join_renders_own():
     workflow = render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get,
                       labels={"hydrowf/owner": "user-1"})

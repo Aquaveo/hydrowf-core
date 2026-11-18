@@ -26,6 +26,11 @@ from hydrowf_core.models.lego import (DataSource, Lego, Link, Pipeline, Pipeline
 
 FILE_TYPES = ("file", "directory")
 RUN_NAME = "{{workflow.name}}"          # {run}: Argo puts the workflow's name here when the pod starts
+# Caller text may not hold what a later stage reads as its own syntax: Argo's {{...}} (expanded, and
+# expanded again, in args, env, paths and keys; there is no escape) and Kubernetes' $(VAR). Single
+# characters, not sequences: caller text is joined to registry text, which could complete them.
+TEMPLATE_SYNTAX = re.compile(r"[{}$\x00-\x1f]")        # and control characters (newlines in args)
+MAX_TEXT = 1024                         # before any registry pattern runs on it
 Entrypoint = Callable[[str], "list[str] | None"]
 
 
@@ -72,6 +77,12 @@ def pipeline_values(pipeline: Pipeline, inputs: Mapping[str, Scalar]) -> dict[st
     values: dict[str, Scalar | None] = {}
     for port in pipeline.inputs:
         value = inputs.get(port.name, port.default)
+        if port.name in inputs and isinstance(value, str):     # the caller's text; defaults are the registry's
+            if len(value) > MAX_TEXT:
+                raise BadInputs(f"input {port.name}: longer than {MAX_TEXT} characters")
+            if TEMPLATE_SYNTAX.search(value):
+                raise BadInputs(f"input {port.name}: {{, }}, $ and control characters are not allowed "
+                                "(Argo and Kubernetes would read them as templates)")
         if value is None:
             if not port.optional:
                 raise BadInputs(f"input {port.name} is required")
@@ -79,7 +90,7 @@ def pipeline_values(pipeline: Pipeline, inputs: Mapping[str, Scalar]) -> dict[st
             s3_key(value)
         elif port.type == "dataset":
             raise UnsupportedForArgo(f"input {port.name}: dataset inputs need a data driver")
-        elif problem := value_problem(port.type, port.symbols, value):
+        elif problem := value_problem(port.type, port.symbols, value, port.pattern):
             raise BadInputs(f"input {port.name}: {problem}")
         values[port.name] = value
     return values
@@ -107,6 +118,9 @@ def task_inputs(step: Step, tool: ToolLego,
             value = src.value
         elif isinstance(src, PipelineInput):
             value = values[src.input]
+            if value is not None and port.pattern is not None and (
+                    problem := value_problem(port.type, port.symbols, value, port.pattern)):
+                raise BadInputs(f"input {src.input} (step {step.name}.{port.name}): {problem}")
         else:
             value = port.default
         if port.type not in FILE_TYPES:
@@ -122,7 +136,10 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
     runtime = {**scalars, "workdir": tool.workdir, "cpu": tool.cpu, "run": RUN_NAME}
 
     def at(path: str) -> str:
-        return f"{tool.workdir}/{fill(path, runtime)}"
+        filled = fill(path, runtime)          # inputs may fill it: check what they made, not the template
+        if filled.startswith("/") or any(part in ("", ".", "..") for part in filled.split("/")):
+            raise BadInputs(f"step {step.name}: path {path!r} becomes {filled!r}, outside {tool.workdir}")
+        return f"{tool.workdir}/{filled}"
 
     paths = {p.name: at(p.path or f"inputs/{p.name}") for p in tool.inputs if p.name in staged}
     values = {**runtime, **{p.name: None for p in tool.inputs if p.type in FILE_TYPES}, **paths}

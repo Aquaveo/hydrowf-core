@@ -75,7 +75,7 @@ def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
                    by_key: dict[tuple[str, str], Lego]) -> str | None:
     """Why `src` can't feed `port`, or None if it can."""
     if isinstance(src, Value):
-        return value_problem(port.type, port.symbols, src.value)
+        return value_problem(port.type, port.symbols, src.value, port.pattern)
     if isinstance(src, DataSource):
         data = by_key.get(src.data.key())
         if not isinstance(data, DataLego):
