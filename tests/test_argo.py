@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hydrowf_core.adapters.argo import BadInputs, UnsupportedForArgo, render
-from hydrowf_core.models import LEGOS, Pipeline
+from hydrowf_core.adapters.argo import BadInputs, UnsupportedForArgo, render, resources
+from hydrowf_core.models import LEGOS, Pipeline, ToolLego
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LEGO_LIST = LEGOS.validate_python(yaml.safe_load((FIXTURES / "legos.yaml").read_text()))
@@ -42,6 +42,13 @@ def test_without_keep_days_a_run_stays_until_deleted():
 def test_keep_days_is_a_whole_number_of_days(keep_days):
     with pytest.raises(ValueError, match="keep_days"):
         render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get, keep_days=keep_days)
+
+
+@pytest.mark.parametrize("cpu, ram_mb, cores", [(4, 16384, "4"), (0.5, 512, "0.5"), (1, 1024, "1")])
+def test_memory_is_capped_at_the_request_and_cpu_is_not(cpu, ram_mb, cores):
+    tool = ToolLego(kind="tool", id="t", version="0.1.0", title="t", image="busybox:1.36", cpu=cpu, ram_mb=ram_mb)
+    assert resources(tool) == {"requests": {"cpu": cores, "memory": f"{ram_mb}Mi"},
+                               "limits": {"memory": f"{ram_mb}Mi"}}
 
 
 def test_inputs_reach_the_command_line_and_artifacts():
