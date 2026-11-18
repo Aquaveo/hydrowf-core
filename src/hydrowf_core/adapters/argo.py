@@ -30,6 +30,7 @@ RUN_NAME = "{{workflow.name}}"          # {run}: Argo puts the workflow's name h
 # expanded again, in args, env, paths and keys; there is no escape) and Kubernetes' $(VAR). Single
 # characters, not sequences: caller text is joined to registry text, which could complete them.
 TEMPLATE_SYNTAX = re.compile(r"[{}$\x00-\x1f]")        # and control characters (newlines in args)
+MAX_KEEP_DAYS = 3650                    # ttlStrategy's seconds are an int32 in Argo: under 24855 days
 MAX_TEXT = 1024                         # before any registry pattern runs on it
 Entrypoint = Callable[[str], "list[str] | None"]
 
@@ -170,7 +171,7 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
 
 def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scalar],
            entrypoint: Entrypoint | None = None, name: str | None = None,
-           labels: Mapping[str, str] | None = None) -> dict:
+           labels: Mapping[str, str] | None = None, keep_days: int | None = None) -> dict:
     """An Argo Workflow that runs `pipeline` once with `inputs`.
 
     `legos` must contain the steps' tools (registry.check has passed on them). `entrypoint(image)`
@@ -179,7 +180,13 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
     Argo copies the name into a pod label, so keep it a DNS name of 63 characters or less.
     `labels` are the caller's own workflow labels (e.g. who submitted the run); they can't replace
     hydrowf/pipeline or hydrowf/version.
+
+    Deleting the workflow deletes its output artifacts and archived logs too (artifactGC). With
+    `keep_days`, Argo deletes the workflow, and so its outputs, that many days after it finishes.
     """
+    if keep_days is not None and (isinstance(keep_days, bool) or not isinstance(keep_days, int)
+                                  or not 1 <= keep_days <= MAX_KEEP_DAYS):
+        raise ValueError(f"keep_days={keep_days!r}: a whole number of days, 1 to {MAX_KEEP_DAYS}")
     extra = check_labels(labels or {})
     if reserved := sorted(set(extra) & set(RESERVED_LABELS)):
         raise ValueError(f"{', '.join(reserved)}: render() sets these labels itself")
@@ -213,5 +220,10 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
             "labels": {**extra, "hydrowf/pipeline": pipeline.id, "hydrowf/version": pipeline.version},
             "annotations": {"hydrowf/outputs": json.dumps(outputs)},      # pipeline output -> task/artifact
         },
-        "spec": {"entrypoint": "main", "templates": [{"name": "main", "dag": {"tasks": tasks}}] + templates},
+        "spec": {
+            "entrypoint": "main",
+            "artifactGC": {"strategy": "OnWorkflowDeletion"},
+            **({"ttlStrategy": {"secondsAfterCompletion": keep_days * 86400}} if keep_days is not None else {}),
+            "templates": [{"name": "main", "dag": {"tasks": tasks}}] + templates,
+        },
     }

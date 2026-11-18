@@ -11,6 +11,7 @@ metadata:
     hydrowf/outputs: '{"run": "run/ngen-run", "cng": "to-cng/cng"}'
 spec:
   entrypoint: main
+  artifactGC: {strategy: OnWorkflowDeletion}     # deleting the run deletes its outputs
   templates:
   - name: main
     dag:

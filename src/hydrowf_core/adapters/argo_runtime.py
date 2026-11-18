@@ -74,7 +74,9 @@ class ArgoRuntime:
         return runs
 
     def delete(self, name: str) -> None:
-        """Delete the workflow (its pods go with it; artifacts in the bucket stay)."""
+        """Delete the workflow. Its pods go with it, and its artifacts too when render() wrote it:
+        Argo deletes them afterwards, in a pod (artifactGC). If that fails, the workflow stays,
+        being deleted, until its artifact-gc finalizer is removed."""
         self.service.delete_workflow(name=name, namespace=self.namespace)
 
     def outputs(self, name: str) -> dict[str, str]:

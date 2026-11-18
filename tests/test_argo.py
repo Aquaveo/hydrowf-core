@@ -28,6 +28,22 @@ def test_simulation_renders_the_expected_workflow():
     assert simulation() == yaml.safe_load((FIXTURES / "argo" / "ngiab-simulation.yaml").read_text())
 
 
+def test_keep_days_has_argo_delete_the_finished_run_and_so_its_outputs():
+    spec = render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get, keep_days=30)["spec"]
+    assert spec["ttlStrategy"] == {"secondsAfterCompletion": 30 * 86400}
+    assert spec["artifactGC"] == {"strategy": "OnWorkflowDeletion"}
+
+
+def test_without_keep_days_a_run_stays_until_deleted():
+    assert "ttlStrategy" not in simulation()["spec"]
+
+
+@pytest.mark.parametrize("keep_days", [0, -1, 1.5, True, "30", 3651])
+def test_keep_days_is_a_whole_number_of_days(keep_days):
+    with pytest.raises(ValueError, match="keep_days"):
+        render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get, keep_days=keep_days)
+
+
 def test_inputs_reach_the_command_line_and_artifacts():
     wf = simulation({**INPUTS, "feature": "cat-5173"})
     args = template(wf, "step-preprocess")["container"]["args"]
