@@ -86,6 +86,9 @@ def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
     if isinstance(src, PipelineInput):
         upstream = pipeline_inputs[src.input]          # declared: the Pipeline model checked it
         what = f"pipeline input {src.input}"
+        if upstream.type == port.type and upstream.default is not None and port.pattern is not None and (
+                problem := value_problem(port.type, port.symbols, upstream.default, port.pattern)):
+            return f"{what}'s default {problem}"       # a registry mistake: at load, not on execute
     else:
         tool = tools.get(src.step)
         if tool is None:

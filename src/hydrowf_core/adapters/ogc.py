@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from hydrowf_core.models.lego import DataLego, Lego, Pipeline, Port, ToolLego
+from hydrowf_core.models.lego import DataLego, Lego, Pipeline, PipelineInput, Port, ToolLego, anchored
 
 S3_URI = r"^s3://[^/]+/.+"
 JSON_TYPES = {"string": "string", "int": "integer", "float": "number", "boolean": "boolean"}
@@ -31,7 +31,7 @@ def port_schema(port: Port) -> dict:
         case Port(type=t) if t in JSON_TYPES:
             schema = {"type": JSON_TYPES[t]}
             if port.pattern is not None:      # JSON Schema patterns aren't anchored; ours match whole values
-                schema["pattern"] = f"^(?:{port.pattern})$"
+                schema["pattern"] = anchored(port.pattern)
         case _:
             raise UnsupportedForOgc(f"port {port.name}: {port.type} ports need a data driver")
     if port.default is not None:          # False and 0 are real defaults
@@ -45,6 +45,20 @@ def describe(port: Port, data_titles: dict[str, str]) -> str:
     if port.data in data_titles:
         parts.append(f"({data_titles[port.data]})")
     return " ".join(parts)
+
+
+def patterns(port: Port, pipeline: Pipeline, tools: dict) -> list[str]:
+    """Every pattern a value of pipeline input `port` must match: its own, then those of the tool ports
+    it feeds (render enforces both)."""
+    found = [port.pattern] if port.pattern else []
+    for step in pipeline.steps:
+        tool = tools.get(step.tool.key())
+        for name, src in step.inputs.items():
+            if isinstance(src, PipelineInput) and src.input == port.name and tool is not None:
+                fed = next((p for p in tool.inputs if p.name == name), None)
+                if fed is not None and fed.pattern and fed.pattern not in found:
+                    found.append(fed.pattern)
+    return found
 
 
 def process_description(pipeline: Pipeline, legos: Iterable[Lego]) -> dict:
@@ -62,10 +76,20 @@ def process_description(pipeline: Pipeline, legos: Iterable[Lego]) -> dict:
     for port in pipeline.inputs:
         if port.type == "dataset":
             raise UnsupportedForOgc(f"input {port.name}: dataset inputs need a data driver")
+        schema = port_schema(port)
+        if port.type == "string":             # file ports keep port_schema's s3:// pattern
+            schema.pop("pattern", None)
+            match patterns(port, pipeline, tools):
+                case []:
+                    pass
+                case [one]:
+                    schema["pattern"] = anchored(one)
+                case several:                 # a value fed to two tools must fit both
+                    schema["allOf"] = [{"pattern": anchored(p)} for p in several]
         inputs[port.name] = {
             "title": port.name,
             "description": describe(port, data_titles),
-            "schema": port_schema(port),
+            "schema": schema,
             "minOccurs": 0 if port.optional or port.default is not None else 1,
             "maxOccurs": 1,
         }

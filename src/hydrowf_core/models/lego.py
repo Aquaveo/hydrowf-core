@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import re
 from enum import Enum
+from functools import lru_cache
 from graphlib import CycleError, TopologicalSorter
 from typing import Annotated, Literal, Union
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic_core import SchemaError
 
 LegoId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9.\-]*$", max_length=63)]
 SemVer = Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
@@ -180,6 +182,21 @@ Scalar = Union[str, int, float, bool]
 VALUE_TYPES = {"string": (str,), "enum": (str,), "int": (int,), "float": (int, float), "boolean": (bool,)}
 
 
+@lru_cache(maxsize=256)
+def whole_match(pattern: str) -> TypeAdapter:
+    """pydantic's check that a string matches all of `pattern`. pydantic runs patterns on Rust's regex
+    engine, in time linear in the value, and searches: hence the anchors (also the OGC schema's form).
+    SchemaError when Rust's engine can't take the pattern (lookarounds, backreferences, \\Z)."""
+    return TypeAdapter(Annotated[str, Field(pattern=anchored(pattern))])
+
+
+OTHER_GROUP = re.compile(r"(?<!\\)\(\?(?!:)")   # (?P<n>, (?i), (?=: everything but (?:
+
+
+def anchored(pattern: str) -> str:
+    return f"^(?:{pattern})$"
+
+
 def value_problem(port_type: str, symbols: list[str], value: Scalar, pattern: str | None = None) -> str | None:
     """Why `value` can't be a value of a port of `port_type`, or None if it can. `pattern` must match
     the whole of a string value."""
@@ -192,8 +209,13 @@ def value_problem(port_type: str, symbols: list[str], value: Scalar, pattern: st
         return f"{value!r} is not a {port_type}"
     if port_type == "enum" and value not in symbols:
         return f"{value!r} is not one of {symbols}"
-    if pattern is not None and not re.fullmatch(pattern, value, flags=re.ASCII):   # \d is 0-9, as in JSON Schema
-        return f"{value!r} does not match {pattern}"
+    if pattern is not None:
+        if not value.isascii():           # Rust's \d also takes other scripts' digits
+            return f"{value!r} does not match {pattern}"
+        try:
+            whole_match(pattern).validate_python(value)
+        except ValidationError:
+            return f"{value!r} does not match {pattern}"
     return None
 
 
@@ -243,8 +265,9 @@ class Port(Strict):
     type: Literal["string", "int", "float", "boolean", "enum", "file", "directory", "dataset"]
     data: LegoId | None = None            # file/directory/dataset: the DataLego id this port carries
     symbols: list[str] = []               # enum only
-    # string only: a regex the whole value must match. It is also the OGC schema's pattern, so keep to
-    # what Python and JSON Schema (ECMA-262) share: no named groups, inline flags or \Z
+    # string only: a regex the whole (ASCII) value must match, run by pydantic on Rust's regex engine.
+    # It is also the OGC schema's pattern, so the only (? group is (?:...); Rust refuses lookarounds,
+    # backreferences and \Z
     pattern: str | None = None
     optional: bool = False
     default: Scalar | None = None         # scalars: used when a step leaves the input unconnected
@@ -264,10 +287,15 @@ class Port(Strict):
         if self.pattern is not None:
             if self.type != "string":
                 raise ValueError(f"port {self.name}: only string ports have a `pattern`")
+            if OTHER_GROUP.search(self.pattern):
+                raise ValueError(f"port {self.name}: pattern {self.pattern!r}: the only (? group is (?:...), "
+                                 "as JSON Schema clients read it")
             try:
-                re.compile(self.pattern, flags=re.ASCII)
-            except re.error as err:
-                raise ValueError(f"port {self.name}: pattern {self.pattern!r}: {err}") from err
+                TypeAdapter(Annotated[str, Field(pattern=self.pattern)])   # alone: a)|(b would hide in the anchors
+                whole_match(self.pattern)
+            except SchemaError as err:
+                raise ValueError(f"port {self.name}: pattern {self.pattern!r} is not one pydantic's "
+                                 f"regex engine takes: {str(err).splitlines()[-1].strip()}") from err
         if self.default is not None:
             problem = value_problem(self.type, self.symbols, self.default, self.pattern)
             if problem:
