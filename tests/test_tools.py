@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import pytest
@@ -5,7 +6,7 @@ import yaml
 from pydantic import ValidationError
 
 from hydrowf_core.models import LEGOS, ToolLego
-from hydrowf_core.models.lego import fill
+from hydrowf_core.models.lego import fill, value_problem
 
 FIXTURE = LEGOS.validate_python(yaml.safe_load((Path(__file__).parent / "fixtures" / "legos.yaml").read_text()))
 TOOLS = {x.id: x for x in FIXTURE if isinstance(x, ToolLego)}
@@ -39,7 +40,11 @@ def values(tool, **given):
     ({**TOOL, "inputs": [port("n", "int", default="6")]}, "'6' is not a int"),
     ({**TOOL, "inputs": [port("s", "enum", symbols=["a"], default="b")]}, "'b' is not one of"),
     ({**TOOL, "inputs": [port("n", "int", pattern=r"\d+")]}, "only string ports have a `pattern`"),
-    ({**TOOL, "inputs": [port("s", pattern="(")]}, r"pattern '\(': missing \)"),
+    ({**TOOL, "inputs": [port("s", pattern="(")]}, r"pattern '\(' is not one pydantic's regex engine takes"),
+    ({**TOOL, "inputs": [port("s", pattern="a(?=b)")]}, r"the only \(\? group is \(\?:"),  # lookahead
+    ({**TOOL, "inputs": [port("s", pattern="(?i)gage")]}, r"the only \(\? group is \(\?:"),  # inline flag
+    ({**TOOL, "inputs": [port("s", pattern="(?P<n>a)")]}, r"the only \(\? group is \(\?:"),  # named group
+    ({**TOOL, "inputs": [port("s", pattern="a)|(b")]}, "is not one pydantic's regex engine takes"),  # unbalanced
     ({**TOOL, "inputs": [port("s", pattern=r"gage-\d+", default="cat-1")]}, r"default 'cat-1' does not match"),
     ({**TOOL, "outputs": [port("o", "file", data="d", path="{run}.txt")]},
      r"\{run\} is only known when the run starts"),
@@ -86,3 +91,21 @@ def test_argv_keeps_groups_whose_input_is_set():
 def test_argv_fills_runtime_values():
     tool = TOOLS["ngiab-run"]
     assert tool.argv(values(tool, ngen_run="/work/ngen-run")) == ["/work/ngen-run", "auto", "4", "local"]
+
+
+def test_patterns_run_in_linear_time():
+    # (a+)+ backtracks exponentially in Python's re; pydantic's Rust engine doesn't
+    started = time.perf_counter()
+    assert value_problem("string", [], "a" * 1000 + "!", "(a+)+") == f"{'a' * 1000 + '!'!r} does not match (a+)+"
+    assert time.perf_counter() - started < 1
+
+
+def test_a_pattern_matches_whole_values_even_with_alternatives():
+    assert value_problem("string", [], "cat-1", "gage-1|cat-1") is None
+    assert value_problem("string", [], "xcat-1", "gage-1|cat-1") == "'xcat-1' does not match gage-1|cat-1"
+    assert value_problem("string", [], "gage-1x", "gage-1|cat-1") == "'gage-1x' does not match gage-1|cat-1"
+
+
+def test_an_escaped_parenthesis_before_a_question_mark_is_a_literal():
+    [tool] = LEGOS.validate_python([{**TOOL, "inputs": [port("s", pattern=r"\(?x")]}])   # an optional "(", then x
+    assert value_problem("string", [], "(x", tool.inputs[0].pattern) is None

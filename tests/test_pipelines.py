@@ -88,3 +88,12 @@ def test_unknown_data_lego_on_a_tool_port_is_reported():
     raw = [x for x in raw if x.get("id") != "hydrofabric-graph"]
     assert check(LEGOS.validate_python(raw)) == [
         "tool ngiab-preprocess@4.9.5: port hydrofabric_graph: unknown data lego 'hydrofabric-graph'"]
+
+
+def test_a_pipeline_default_must_fit_the_pattern_of_the_tool_port_it_feeds():
+    raw = copy.deepcopy(RAW)
+    to_cng = next(x for x in raw if x.get("id") == "ngiab-to-cng")
+    next(p for p in to_cng["inputs"] if p["name"] == "configuration_name")["pattern"] = "[a-z]+"   # "ngiab" fits
+    assert check(LEGOS.validate_python(raw)) == [
+        "pipeline ngiab-simulation@0.1.0: step to-cng.configuration_name: pipeline input "
+        "configuration_name's default 'ngiab_cfe_default' does not match [a-z]+"]

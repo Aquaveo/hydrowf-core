@@ -55,3 +55,23 @@ def test_dataset_inputs_are_not_supported_yet():
 def test_step_defaults_the_pipeline_does_not_expose_stay_hidden():
     inputs = process_description(PIPELINES["ngiab-simulation"], LEGO_LIST)["inputs"]
     assert "source" not in inputs and "precip_max_gap" not in inputs    # ngiab-preprocess defaults
+
+
+def with_tool_pattern(tool_id, port_name, pattern, legos=LEGO_LIST):
+    return [x.model_copy(update={"inputs": [p.model_copy(update={"pattern": pattern}) if p.name == port_name else p
+                                            for p in x.inputs]}) if x.id == tool_id else x for x in legos]
+
+
+def test_a_pipeline_input_publishes_the_pattern_of_the_tool_port_it_feeds():
+    legos = with_tool_pattern("ngiab-preprocess", "feature", "gage-[0-9]+")
+    schema = process_description(PIPELINES["ngiab-simulation"], legos)["inputs"]["feature"]["schema"]
+    assert schema == {"type": "string", "pattern": "^(?:gage-[0-9]+)$"}
+
+
+def test_a_value_bound_by_two_patterns_publishes_both():
+    legos = with_tool_pattern("ngiab-preprocess", "feature", "gage-[0-9]+")
+    pipeline = PIPELINES["ngiab-simulation"]
+    own = [p.model_copy(update={"pattern": "[a-z0-9-]{1,20}"}) if p.name == "feature" else p for p in pipeline.inputs]
+    schema = process_description(pipeline.model_copy(update={"inputs": own}), legos)["inputs"]["feature"]["schema"]
+    assert schema == {"type": "string", "allOf": [{"pattern": "^(?:[a-z0-9-]{1,20})$"},
+                                                  {"pattern": "^(?:gage-[0-9]+)$"}]}
