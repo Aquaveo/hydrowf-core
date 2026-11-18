@@ -131,6 +131,22 @@ def task_inputs(step: Step, tool: ToolLego,
     return scalars, artifacts
 
 
+def resources(tool: ToolLego) -> dict:
+    """The step container's Kubernetes resources, from the tool's cpu and ram_mb.
+
+    requests: what the scheduler reserves on a node for the step (where it can run).
+    limits: the most the step may use once running. Past a memory limit the kernel kills the
+    container (OOMKilled, the step fails); past a CPU limit it is only slowed down (throttled).
+    Without limits a step can take a whole node from everyone else's steps.
+    """
+    requests = {"cpu": fill("{cpu}", {"cpu": tool.cpu}), "memory": f"{tool.ram_mb}Mi"}
+    # Memory is capped at the request: a step that outgrows its ram_mb fails alone, instead of
+    # pushing the node out of memory and taking other users' steps with it. CPU is not capped:
+    # a step may use idle cores, and when cores are short Kubernetes shares them by request, so a
+    # busy step slows the others down to their requested cores at worst, never below.
+    return {"requests": requests, "limits": {"memory": requests["memory"]}}
+
+
 def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | None], staged: Iterable[str],
                        entrypoint: Entrypoint | None) -> dict:
     """One step's Argo template: stage inputs and files under the workdir, run, collect outputs."""
@@ -156,7 +172,7 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
     container["workingDir"] = tool.workdir
     if tool.env:
         container["env"] = [{"name": k, "value": fill(v, values)} for k, v in tool.env.items()]
-    container["resources"] = {"requests": {"cpu": fill("{cpu}", values), "memory": f"{tool.ram_mb}Mi"}}
+    container["resources"] = resources(tool)
     container["volumeMounts"] = [{"name": "work", "mountPath": tool.workdir}]
 
     return {
