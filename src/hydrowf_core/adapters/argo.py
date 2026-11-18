@@ -18,6 +18,7 @@ What running on Argo v4.1.6 taught us (hydrowf-platform docs/argo-findings.md):
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping
 
 from hydrowf_core.models.lego import (DataSource, Lego, Link, Pipeline, PipelineInput, Scalar, Step, ToolLego, Value,
@@ -30,6 +31,23 @@ Entrypoint = Callable[[str], "list[str] | None"]
 
 class UnsupportedForArgo(ValueError):
     """The pipeline uses something this adapter can't run yet."""
+
+
+LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?")   # Kubernetes' rule
+LABEL_NAME = r"[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?"
+DNS_LABEL = r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
+LABEL_KEY = re.compile(rf"(?:(?=[^/]{{1,253}}/){DNS_LABEL}(?:\.{DNS_LABEL})*/)?{LABEL_NAME}")   # [prefix/]name
+RESERVED_LABELS = ("hydrowf/pipeline", "hydrowf/version")       # render() sets these itself
+
+
+def check_labels(labels: Mapping[str, str]) -> dict[str, str]:
+    """`labels` if every key and value is a valid Kubernetes label; ValueError otherwise. Callers build
+    label selectors from them, so a value like "a,b" or "x!=y" must never get through."""
+    for key, value in labels.items():
+        if not (isinstance(key, str) and isinstance(value, str)
+                and LABEL_KEY.fullmatch(key) and LABEL_VALUE.fullmatch(value)):
+            raise ValueError(f"{key}={value!r} is not a valid Kubernetes label")
+    return dict(labels)
 
 
 class BadInputs(ValueError):
@@ -134,14 +152,20 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
 
 
 def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scalar],
-           entrypoint: Entrypoint | None = None, name: str | None = None) -> dict:
+           entrypoint: Entrypoint | None = None, name: str | None = None,
+           labels: Mapping[str, str] | None = None) -> dict:
     """An Argo Workflow that runs `pipeline` once with `inputs`.
 
     `legos` must contain the steps' tools (registry.check has passed on them). `entrypoint(image)`
     gives the ENTRYPOINT of images whose tool leaves `command` empty. `name` names the workflow (the
     caller's id for the run, e.g. a pygeoapi job id); without it Argo generates `<pipeline id>-xxxxx`.
     Argo copies the name into a pod label, so keep it a DNS name of 63 characters or less.
+    `labels` are the caller's own workflow labels (e.g. who submitted the run); they can't replace
+    hydrowf/pipeline or hydrowf/version.
     """
+    extra = check_labels(labels or {})
+    if reserved := sorted(set(extra) & set(RESERVED_LABELS)):
+        raise ValueError(f"{', '.join(reserved)}: render() sets these labels itself")
     tools = {(x.id, x.version): x for x in legos if isinstance(x, ToolLego)}
     values = pipeline_values(pipeline, inputs)
     steps = {s.name: s for s in pipeline.steps}
@@ -169,7 +193,7 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
         "kind": "Workflow",
         "metadata": {
             **({"name": name} if name else {"generateName": f"{pipeline.id}-"}),
-            "labels": {"hydrowf/pipeline": pipeline.id, "hydrowf/version": pipeline.version},
+            "labels": {**extra, "hydrowf/pipeline": pipeline.id, "hydrowf/version": pipeline.version},
             "annotations": {"hydrowf/outputs": json.dumps(outputs)},      # pipeline output -> task/artifact
         },
         "spec": {"entrypoint": "main", "templates": [{"name": "main", "dag": {"tasks": tasks}}] + templates},
