@@ -68,3 +68,25 @@ def test_dataset_inputs_need_a_data_driver():
 def test_bad_inputs_are_rejected_before_anything_is_rendered(inputs, message):
     with pytest.raises(BadInputs, match=message):
         simulation(inputs)
+
+
+def test_caller_labels_join_renders_own():
+    workflow = render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get,
+                      labels={"hydrowf/owner": "user-1"})
+    assert workflow["metadata"]["labels"] == {"hydrowf/owner": "user-1", "hydrowf/pipeline": "ngiab-simulation",
+                                              "hydrowf/version": "0.1.0"}
+
+
+@pytest.mark.parametrize("labels, message", [
+    ({"hydrowf/pipeline": "other"}, "render\\(\\) sets these labels itself"),
+    ({"hydrowf/version": "9.9.9"}, "render\\(\\) sets these labels itself"),
+    ({"hydrowf/owner": "a,b"}, "not a valid Kubernetes label"),
+    ({"hydrowf/owner": "x" * 64}, "not a valid Kubernetes label"),
+    ({"bad key!": "x"}, "not a valid Kubernetes label"),
+    ({"-./x": "x"}, "not a valid Kubernetes label"),             # the prefix is a DNS subdomain
+    ({("a" * 64) + "/x": "x"}, "not a valid Kubernetes label"),
+    ({1: "x"}, "not a valid Kubernetes label"),                   # a ValueError, never a TypeError
+])
+def test_caller_labels_are_checked(labels, message):
+    with pytest.raises(ValueError, match=message):
+        render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get, labels=labels)

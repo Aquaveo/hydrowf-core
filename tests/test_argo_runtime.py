@@ -11,11 +11,14 @@ from pathlib import Path
 import yaml
 from hera.workflows import models as m
 
+import pytest
+
 from hydrowf_core.adapters.argo_runtime import ArgoRuntime, RunStatus
 
 FIXTURES = Path(__file__).parent / "fixtures" / "argo"
 SUCCEEDED = json.loads((FIXTURES / "status-ngiab-simulation-succeeded.json").read_text())
 NAME = SUCCEEDED["metadata"]["name"]
+LABELS = SUCCEEDED["metadata"]["labels"]          # what render() set on the recorded run
 
 
 class StubService:
@@ -84,7 +87,7 @@ def test_status_of_a_finished_run():
     assert status == RunStatus(NAME, "Succeeded", "", {"preprocess": "Succeeded", "run": "Succeeded"},
                                pipeline="ngiab-simulation", created_at=at("2026-11-15T00:29:58Z"),
                                started_at=at("2026-11-15T00:29:58Z"), finished_at=at("2026-11-15T00:40:15Z"),
-                               progress="2/2")
+                               progress="2/2", labels=LABELS)
     assert status.finished
 
 
@@ -114,7 +117,13 @@ def test_progress_after_a_failed_step():
 def test_status_before_the_controller_sees_it():
     wf = {k: v for k, v in SUCCEEDED.items() if k != "status"}
     assert runtime(wf).status(NAME) == RunStatus(NAME, "Pending", pipeline="ngiab-simulation",
-                                                 created_at=at("2026-11-15T00:29:58Z"))
+                                                 created_at=at("2026-11-15T00:29:58Z"), labels=LABELS)
+
+
+def test_status_carries_the_callers_labels():
+    wf = copy.deepcopy(SUCCEEDED)
+    wf["metadata"]["labels"] = {**LABELS, "hydrowf/owner": "user-1"}
+    assert runtime(wf).status(NAME).labels["hydrowf/owner"] == "user-1"
 
 
 def test_outputs_of_a_finished_run():
@@ -150,6 +159,20 @@ def test_list_of_one_pipeline():
     rt = runtime(listed=older_and_newer())
     rt.list("ngiab-simulation")
     assert rt.service.list_calls == [("argo", "hydrowf/pipeline=ngiab-simulation")]
+
+
+def test_list_of_one_callers_runs():
+    rt = runtime(listed=older_and_newer())
+    rt.list(labels={"hydrowf/owner": "8d3a6e2c-1f0b-4c4e-9a51-0e6d2b7c9f10"})
+    assert rt.service.list_calls == [("argo", "hydrowf/pipeline,hydrowf/owner=8d3a6e2c-1f0b-4c4e-9a51-0e6d2b7c9f10")]
+
+
+@pytest.mark.parametrize("value", ["a,hydrowf/owner", "x!=y", "a b", "-bad", "x" * 64])
+def test_a_label_that_would_change_the_selector_is_refused(value):
+    rt = runtime(listed=older_and_newer())
+    with pytest.raises(ValueError, match="not a valid Kubernetes label"):
+        rt.list(labels={"hydrowf/owner": value})
+    assert rt.service.list_calls == []                                    # nothing reached Argo
 
 
 def test_list_items_carry_their_status():

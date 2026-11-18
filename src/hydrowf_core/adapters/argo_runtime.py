@@ -12,11 +12,14 @@ The bucket is the cluster's artifact repository bucket: Argo records only the ke
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from hera.workflows import WorkflowsService
 from hera.workflows import models as m
+
+from hydrowf_core.adapters.argo import check_labels
 
 FINISHED = ("Succeeded", "Failed", "Error")
 DONE = ("Succeeded", "Skipped", "Omitted")          # step phases that count toward progress
@@ -33,6 +36,7 @@ class RunStatus:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     progress: str = ""                    # "<done>/<total>" of the planned steps, e.g. "2/3"
+    labels: dict[str, str] = field(default_factory=dict)   # the workflow's labels, render()'s and the caller's
 
     @property
     def finished(self) -> bool:
@@ -58,11 +62,12 @@ class ArgoRuntime:
     def status(self, name: str) -> RunStatus:
         return run_status(self._get(name))
 
-    def list(self, pipeline: str | None = None) -> list[RunStatus]:
+    def list(self, pipeline: str | None = None, labels: Mapping[str, str] | None = None) -> list[RunStatus]:
         """The runs render() made (they carry the hydrowf/pipeline label), newest first; only
-        `pipeline`'s runs when it is given."""
-        label = f"hydrowf/pipeline={pipeline}" if pipeline else "hydrowf/pipeline"
-        workflow_list = self.service.list_workflows(namespace=self.namespace, label_selector=label)
+        `pipeline`'s runs when it is given, and only those carrying every one of `labels`."""
+        selector = [f"hydrowf/pipeline={pipeline}" if pipeline else "hydrowf/pipeline"]
+        selector += [f"{key}={value}" for key, value in check_labels(labels or {}).items()]
+        workflow_list = self.service.list_workflows(namespace=self.namespace, label_selector=",".join(selector))
         runs = [run_status(workflow) for workflow in workflow_list.items or []]
 
         runs.sort(key=lambda run: (run.created_at is not None, run.created_at), reverse=True)
@@ -122,7 +127,8 @@ def progress(steps: dict[str, str], planned: list[str], argo_progress: str) -> s
 def run_status(wf: m.Workflow) -> RunStatus:
     """A RunStatus from one workflow (a get_workflow answer or a list_workflows item)."""
     meta, status = wf.metadata, wf.status
-    common = dict(pipeline=(meta.labels or {}).get("hydrowf/pipeline", ""), created_at=time(meta.creation_timestamp))
+    labels = dict(meta.labels or {})
+    common = dict(pipeline=labels.get("hydrowf/pipeline", ""), labels=labels, created_at=time(meta.creation_timestamp))
     if status is None:                                   # the controller hasn't picked it up yet
         return RunStatus(meta.name, "Pending", **common)
     steps = {n.display_name: n.phase or "Pending" for n in (status.nodes or {}).values() if n.type == "Pod"}
