@@ -14,6 +14,9 @@ dependencies = [
 argo = [
     "hera>=7.2",
 ]
+auth = [
+    "pyjwt[crypto]>=2.15",
+]
 
 [dependency-groups]
 dev = ["pytest>=8", "flake8>=7"]
