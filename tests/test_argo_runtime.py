@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from hera.exceptions import InternalServerError
 from hera.workflows import models as m
 
 import pytest
@@ -22,13 +23,14 @@ LABELS = SUCCEEDED["metadata"]["labels"]          # what render() set on the rec
 
 
 class StubService:
-    """Answers get_workflow and list_workflows from recorded responses; keeps every create, list and
-    delete request."""
+    """Answers get_workflow and list_workflows from recorded responses; keeps every create, list,
+    terminate and delete request."""
 
     def __init__(self, workflow, listed=()):
         self.workflow = workflow
         self.listed = list(listed)
-        self.created, self.list_calls, self.deleted = [], [], []
+        self.created, self.list_calls, self.deleted, self.terminated = [], [], [], []
+        self.on_terminate = None              # a test's stand-in for Argo answering a terminate
 
     def get_workflow(self, name, namespace=None):
         return m.Workflow.model_validate({"spec": {}, **self.workflow})    # the fixture keeps no spec
@@ -40,6 +42,11 @@ class StubService:
 
     def delete_workflow(self, name, namespace=None, **_):
         self.deleted.append((name, namespace))
+
+    def terminate_workflow(self, name, req, namespace=None):
+        self.terminated.append((name, req.name, namespace))
+        if self.on_terminate:
+            self.on_terminate(self)
 
     def create_workflow(self, req, namespace=None):
         self.created.append((req, namespace))
@@ -180,10 +187,39 @@ def test_list_items_carry_their_status():
     assert run == runtime().status(NAME)
 
 
-def test_delete_removes_the_workflow():
+def test_deleting_a_finished_run_only_deletes_it():      # Argo refuses to terminate a completed run
     rt = runtime()
     rt.delete(NAME)
+    assert rt.service.terminated == [] and rt.service.deleted == [(NAME, "argo")]
+
+
+@pytest.mark.parametrize("phase", ["Pending", "Running"])
+def test_an_unfinished_run_is_terminated_before_it_is_deleted(phase):
+    rt = runtime(while_run_is(phase))       # else Argo keeps running it, held by the artifact-gc finalizer
+    rt.delete(NAME)
+    assert rt.service.terminated == [(NAME, NAME, "argo")] and rt.service.deleted == [(NAME, "argo")]
+
+
+def test_a_run_that_finishes_before_the_terminate_is_still_deleted():
+    def finish_then_refuse(service):        # Argo: "cannot shutdown a completed workflow", a 500
+        service.workflow = copy.deepcopy(SUCCEEDED)
+        raise InternalServerError("cannot shutdown a completed workflow")
+
+    rt = runtime(while_run_is("Running"))
+    rt.service.on_terminate = finish_then_refuse
+    rt.delete(NAME)
     assert rt.service.deleted == [(NAME, "argo")]
+
+
+def test_a_terminate_that_fails_for_a_running_run_keeps_it():
+    def refuse(service):
+        raise InternalServerError("etcd unavailable")
+
+    rt = runtime(while_run_is("Running"))
+    rt.service.on_terminate = refuse
+    with pytest.raises(InternalServerError):
+        rt.delete(NAME)
+    assert rt.service.deleted == []          # not deleted half-stopped: the caller sees the error
 
 
 def test_a_run_without_a_creation_time_sorts_last():
