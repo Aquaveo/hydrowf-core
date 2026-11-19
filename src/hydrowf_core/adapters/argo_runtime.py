@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from hera.exceptions import InternalServerError
 from hera.workflows import WorkflowsService
 from hera.workflows import models as m
 
@@ -74,9 +75,23 @@ class ArgoRuntime:
         return runs
 
     def delete(self, name: str) -> None:
-        """Delete the workflow. Its pods go with it, and its artifacts too when render() wrote it:
-        Argo deletes them afterwards, in a pod (artifactGC). If that fails, the workflow stays,
-        being deleted, until its artifact-gc finalizer is removed."""
+        """Stop the workflow if it is still running, then delete it. Its pods go with it, and its
+        artifacts too when render() wrote it: Argo deletes them afterwards, in a pod (artifactGC).
+        If that fails, the workflow stays, being deleted, until its artifact-gc finalizer is removed.
+
+        A run is terminated first because Argo collects artifacts only once a run has completed: a
+        running workflow that is only deleted waits on its artifact-gc finalizer and keeps running,
+        steps and all, until it ends on its own. Argo refuses to terminate a completed run (a 500),
+        so a run that finishes between the status check and the terminate is deleted all the same.
+        """
+        if not self.status(name).finished:
+            try:
+                self.service.terminate_workflow(
+                    name=name, req=m.WorkflowTerminateRequest(name=name, namespace=self.namespace),
+                    namespace=self.namespace)
+            except InternalServerError:
+                if not self.status(name).finished:      # not the race: a real failure
+                    raise
         self.service.delete_workflow(name=name, namespace=self.namespace)
 
     def outputs(self, name: str) -> dict[str, str]:
