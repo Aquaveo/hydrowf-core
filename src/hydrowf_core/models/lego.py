@@ -14,17 +14,19 @@ data-authors create managed data and deploy tools; anyone may add external data)
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from enum import Enum
 from functools import lru_cache
 from graphlib import CycleError, TopologicalSorter
 from typing import Annotated, Literal, Union
+from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 from pydantic_core import SchemaError
 
 LegoId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9.\-]*$", max_length=63)]
-SemVer = Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
+SemVer = Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$", max_length=32)]   # bounded: services sort by it
 
 
 class Strict(BaseModel):
@@ -40,8 +42,8 @@ class Visibility(str, Enum):
 class LegoBase(Strict):
     id: LegoId
     version: SemVer                       # immutable: a change is a new version
-    title: str
-    description: str = ""
+    title: Annotated[str, Field(max_length=200)]
+    description: Annotated[str, Field(max_length=10_000)] = ""
     owner: str = ""                       # set by the backend from the Keycloak user, never by the form
     visibility: Visibility = Visibility.OWNER
 
@@ -150,9 +152,32 @@ class StacStorage(Strict):
     properties: dict[str, str] = {}       # STAC property -> manifest / run field
 
 
+def public_host(url: str) -> str:
+    """`url`, if its host could be a public one: refuses a URL without a host, localhost names, and IP
+    literals that are loopback, private, link-local (e.g. 169.254.169.254, cloud metadata), reserved,
+    multicast or unspecified. A first line of defense only: a public name can still resolve to an
+    internal address, so whatever fetches the URL must check the address it connects to."""
+    host = urlsplit(url).hostname
+    if not host:
+        raise ValueError("the URL needs a host")
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError(f"{host} is not a public host")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # Not an IP in standard form. Refuse the numeric shorthands many clients still connect to
+        # (2130706433, 0x7f.1, 127.1 are all 127.0.0.1): a DNS name's last label is never numeric.
+        if re.fullmatch(r"\d+|0x[0-9a-f]*", host.rsplit(".", 1)[-1]):
+            raise ValueError(f"{host} is a numeric host; use a name or a standard public IP") from None
+        return url
+    if not address.is_global or address.is_multicast:
+        raise ValueError(f"{host} is not a public address")
+    return url
+
+
 class ExternalStorage(Strict):
     driver: Literal["external"]
-    url: Annotated[str, Field(pattern=r"^(s3|https)://")]   # no file://, no internal hosts
+    url: Annotated[str, Field(pattern=r"^(s3|https)://", max_length=2048), AfterValidator(public_host)]
     format: Literal["zarr", "netcdf", "parquet", "cog", "api", "other"]
     access: Literal["anonymous"] = "anonymous"              # v1: no stored credentials
 
