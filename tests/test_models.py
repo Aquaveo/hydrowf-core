@@ -77,3 +77,49 @@ def test_bad_table_layouts_are_rejected(bad, message):
 ])
 def test_good_table_layouts_pass(good):
     LEGOS.validate_python([good])
+
+
+# ---- bounded fields, and external URLs that can't point inside the cluster
+
+
+def external(url):
+    return {**DATA, "data_kind": "external", "storage": {"driver": "external", "url": url, "format": "other"}}
+
+
+@pytest.mark.parametrize("bad, message", [
+    ({**TOOL, "version": "1.0." + "1" * 40}, "at most 32"),          # services sort versions as numbers
+    ({**TOOL, "title": "x" * 201}, "at most 200"),
+    ({**TOOL, "description": "x" * 10_001}, "at most 10000"),
+    (external("https://" + "a" * 2050 + ".org/"), "at most 2048"),
+], ids=["version", "title", "description", "url"])
+def test_text_fields_are_bounded(bad, message):
+    with pytest.raises(ValidationError, match=message):
+        LEGOS.validate_python([bad])
+
+
+@pytest.mark.parametrize("url", [
+    "https://localhost:8080/x", "https://a.localhost/x",
+    "https://127.0.0.1/x", "https://10.0.0.5/x", "https://192.168.1.1/x",
+    "https://169.254.169.254/latest/meta-data/",                    # cloud metadata
+    "https://[::1]/x", "https://[::ffff:10.0.0.1]/x", "https://0.0.0.0/x",
+    "https://2130706433/x", "https://0x7f.1/x", "https://127.1/x",  # numeric shorthands for 127.0.0.1
+    "s3:///no-bucket",
+])
+def test_external_urls_must_name_a_public_host(url):
+    with pytest.raises(ValidationError, match="public|host"):
+        LEGOS.validate_python([external(url)])
+
+
+@pytest.mark.parametrize("url", [
+    "s3://noaa-nwm-retrospective-3-0-pds/CONUS/zarr/forcing/", "https://data.example.org/x.nc",
+    "https://8.8.8.8/x",
+])
+def test_public_external_urls_pass(url):
+    assert LEGOS.validate_python([external(url)])[0].storage.url == url
+
+
+def test_the_limits_are_in_the_json_schema():
+    """Forms and agent tools read the schema: they can refuse too-long values before sending them."""
+    schema = DataLego.model_json_schema()
+    assert schema["properties"]["title"]["maxLength"] == 200
+    assert schema["properties"]["version"]["maxLength"] == 32
