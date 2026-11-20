@@ -105,7 +105,7 @@ What can feed a step input today, and what step 3 adds:
 | Pipeline file/directory input (an `s3://` URL) | file, directory | yes: an earlier job's output or a key under `shared_inputs` | **the URL's data must match the port's** (3.3) |
 | Link to another step's output | file, directory | yes | uses the chosen format (2.2) |
 | `DataSource` of an **external** data lego | dataset | refused | **the tool gets the URL** (3.1) |
-| `DataSource` of a **managed STAC** data lego | file, directory | refused | **staged from its location** (3.2) |
+| `DataSource` of a **managed STAC** data lego | file, directory, dataset | refused | **staged from its location**, or read in place (3.2, D.4) |
 | `DataSource` of an Iceberg data lego | dataset | refused | `check()` accepts the wiring; `render()` refuses (no Argo driver yet) |
 
 ### 3.1 External driver
@@ -136,9 +136,8 @@ A managed STAC data lego is data the platform keeps (today the conus hydrofabric
 - A `DataSource` of such a lego feeds a file or directory port by **staging** (an Argo artifact from that
   key, as a pipeline file input is today). The key's form says which: ending in `/` is a directory, else a
   file; `check()` refuses a mismatch.
-- **Not a dataset port.** Staging uses Argo's credentials; tool pods have none for the platform bucket, so
-  an `s3://` URL to managed data couldn't be read. Giving tools read access to the bucket is a trust
-  decision for later (it would let any tool read every managed key).
+- **A dataset port** reads it in place with read keys the step gets from the vendor (D.4); without
+  render's `reader` that is refused.
 - render refuses a workflow named `managed`: its outputs (`<workflow name>/...`) would land under
   `managed/`. hydrowf-ogc's job ids are UUIDs, but render is a public API.
 - Who may publish managed data stays as decided: `tool-authors` only (hydrowf-registry). Getting the bytes to
@@ -256,33 +255,64 @@ own policy: `GetObject`/`ListBucket` on the bucket, nothing else), so a session 
   how to open a Zarr asset: `xr.open_zarr("s3://…/forcings.zarr", storage_options={…})`.
 - Shared managed data can be added to the prefixes later (a public read-only prefix needs no vending).
 
-### D.4 For tools (second)
+### D.4 For tools (decided 2026-11-20)
 
-A tool could then read managed data or a job's CNG output from a `dataset` port, in place, instead of
-having it staged (TEEHR reading `timeseries/*.parquet`). The hard part is **getting keys into the pod**:
+A tool reads managed data or one of the caller's job outputs from a `dataset` port, in place, instead of
+having it staged (TEEHR reading `timeseries/*.parquet`). Links between steps of one run stay staged.
 
-- **Never in the workflow spec.** Argo keeps specs in the cluster and in its archive, and anyone who can
-  read workflows could read the keys. Keys minted at submit would also expire while a run waits in a
-  queue.
-- **Proposed:** an init step in the pod asks an in-cluster vending endpoint for keys, proving who it is
-  with a projected service-account token (audience: the vendor). The vendor reads the workflow's own
-  record of the step's dataset inputs (an annotation render writes, like `hydrowf/formats`) and scopes the
-  keys to exactly those prefixes. A refresh before expiry covers long steps.
-- `check()` then allows managed and job-output data on dataset ports (Part B refuses them today).
+- **What a dataset port takes:** a managed STAC data lego (`{data: …}`, its `location`), or a pipeline
+  input of type `dataset` given as `s3://<bucket>/<key>`: in our bucket, a plain key with no empty, `.` or
+  `..` part (render refuses anything else, and a dataset port fed by any other input or by a constant).
+  hydrowf-ogc checks it is the caller's own job output, and its recorded type, as for files: **a blocking
+  part of PR 7b**, since render passes no `reader` before that. The tool gets `s3://<bucket>/<key>`.
+- **Never keys in the workflow spec.** Argo keeps specs in the cluster and in its archive, and keys minted
+  at submit would expire while a run waits in a queue.
+- **How the step gets keys** (`render(reader=Reader(...))`, adapters/argo.py):
+  - render records each step's keys in the workflow annotation `hydrowf/reads` (`{step: [keys]}`);
+  - the step's pod gets a projected service-account token (audience `hydrowf-vendor`, 10 minutes) and
+    an init container (any image with curl, pinned by digest) that POSTs the token, as the request body,
+    to the vendor and writes the answer, an AWS credentials file, into a memory-backed folder;
+  - the tool gets that folder read-only, and the platform's environment, which overrides the tool's and
+    the image's: `AWS_SHARED_CREDENTIALS_FILE`, `AWS_PROFILE=default`, `AWS_CONFIG_FILE` (absent),
+    `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` empty (they would come before the
+    file), `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3`, `AWS_REGION`/`AWS_DEFAULT_REGION`; for GDAL and
+    rasterio `CPL_AWS_CREDENTIALS_FILE`, `AWS_S3_ENDPOINT`, `AWS_HTTPS`, `AWS_VIRTUAL_HOSTING=FALSE`. The
+    tool's own `AWS_*` variables are dropped in such a step. Readers: botocore (boto3, s3fs, xarray,
+    pandas) and GDAL/rasterio read these. DuckDB needs a `CREATE SECRET (TYPE s3, PROVIDER
+    credential_chain)` and its `s3_endpoint`/`s3_url_style` settings from these values; readers built on
+    Rust `object_store` (polars, deltalake) don't read the credentials file and aren't supported yet.
+    Not verified on a cluster yet for DuckDB and GDAL.
+  - Such a step can't also read another `s3://` bucket (an external data lego): its endpoint and keys are
+    ours, so render refuses the mix.
+- **The vendor** is an internal port of hydrowf-ogc (not on the ingress). Its rules (PR 7b):
+  1. TokenReview with **`audiences: [hydrowf-vendor]`**: only the init container's token passes, not the
+     pod's default service-account token (also bound to the pod, and visible to the tool).
+  2. The pod (from the review's pod name and uid, which must match) belongs to a workflow carrying
+     hydrowf-ogc's labels (`hydrowf/owner`, `hydrowf/pipeline`), and to one of its steps.
+  3. The keys are that step's entry in `hydrowf/reads`, each checked again (our bucket, a plain key);
+     a folder key (ending in `/`) covers what is under it, any other key that one object.
+  4. 1-hour keys (the most role chaining allows on EKS), scoped as D.2. No refresh: a step that reads for
+     longer fails its reads after that, until a tool needs more.
+  `hydrowf/reads` is trusted because only hydrowf-ogc creates workflows in its namespace: anyone else
+  with workflow create rights there (Argo UI or CLI users, CI) could write any keys. The deployment
+  (PR 7c) keeps those rights to hydrowf-ogc's service account.
+- `check()` allows managed data on dataset ports; render refuses them without a `reader`.
 
 ### D.5 Security notes
 
 - Keys are read-only, prefix-scoped and short-lived; the session policy can only narrow the parent's.
-- Prefixes come from what the platform recorded (Argo's output keys, the workflow's annotations,
-  managed data legos' `location`), never from the caller.
+- Prefixes come from what the platform recorded or checked: Argo's output keys (inside the job's own
+  keys), managed data legos' `location`, and caller dataset inputs only after hydrowf-ogc checked them as
+  the caller's own job outputs (D.4); never a key the caller names unchecked.
 - Keys never go into workflow specs, annotations, logs or URLs; the response is `no-store`.
 - `ListBucket` is limited by an `s3:prefix` condition, so a session can't list other jobs' keys.
 
 ### D.6 Open questions
 
-1. Session length: 15 minutes (the STS minimum) or 60? A reader holding a Zarr open for longer refreshes.
-2. Is the new cluster's S3 RustFS too? If not, its STS must be checked the same way.
-3. D.3 alone, before step 4, or D.3 and D.4 together so TEEHR reads in place from the start?
+1. ~~Session length~~: decided, 15 minutes for clients (D.3), 1 hour for steps (D.4).
+2. ~~The new cluster's S3~~: decided, EKS with AWS S3 and STS; test a sparse Zarr there (a missing key
+   may answer 403, hydrowf-ogc docs/ogc.md Known gaps).
+3. ~~Order~~: decided, D.3 and D.4 together.
 
 ## 8. Work breakdown
 
@@ -294,7 +324,9 @@ having it staged (TEEHR reading `timeseries/*.parquet`). The hard part is **gett
 | 4 | hydrowf-tools | ngiab-to-cng 0.3.0 (run inputs as is), cng-to-ngen 0.1.0, round-trip test | |
 | 5 | hydrowf-ogc | pin the two new images; `ngen-cng@2.0.0`; a pipeline that reruns from CNG | 3, 4 |
 | 6 | hydrowf-deploy, hydrowf-ogc | D.3: a read-only S3 user; `/ogc/jobs/{id}/credentials`; Items say how to open Zarr | |
-| 7 | hydrowf-core, hydrowf-ogc | D.4: the vending endpoint, init step, dataset ports for managed and job-output data | 6 |
+| 7a | hydrowf-core | D.4: dataset ports read in place; `Reader` (init container, token, env); `hydrowf/reads` | 6 |
+| 7b | hydrowf-ogc | D.4: the vendor (internal port: TokenReview, pod, workflow, keys); `reader` for render | 7a |
+| 7c | hydrowf-deploy | D.4: RBAC for the vendor; reaching it from pods on kind | 7b |
 
 Each PR: tests first, gates, an independent review (the core PRs change a public API).
 

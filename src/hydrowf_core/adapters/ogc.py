@@ -26,7 +26,7 @@ def port_schema(port: Port) -> dict:
     match port:
         case Port(type="enum", symbols=symbols):
             schema = {"type": "string", "enum": list(symbols)}
-        case Port(type="file" | "directory"):
+        case Port(type="file" | "directory" | "dataset"):     # a dataset: an s3:// key read in place
             schema = {"type": "string", "format": "uri", "pattern": S3_URI}
         case Port(type=t) if t in JSON_TYPES:
             schema = {"type": JSON_TYPES[t]}
@@ -76,9 +76,6 @@ def process_description(pipeline: Pipeline, legos: Iterable[Lego]) -> dict:
 
     inputs = {}
     for port in pipeline.inputs:
-        if port.type == "dataset":
-            raise UnsupportedForOgc(f"input {port.name}: a dataset comes from a registered data lego, "
-                                    "not from the caller")
         schema = port_schema(port)
         if port.type == "string":             # file ports keep port_schema's s3:// pattern
             schema.pop("pattern", None)

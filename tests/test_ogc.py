@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hydrowf_core.adapters.ogc import S3_URI, UnsupportedForOgc, port_schema, process_description
+from hydrowf_core.adapters.ogc import S3_URI, port_schema, process_description
 from hydrowf_core.models import LEGOS, Pipeline
 from hydrowf_core.models.lego import Port
 
@@ -45,11 +45,11 @@ def test_s3_pattern_accepts_any_bucket_and_rejects_other_schemes():
     assert not pattern.match("s3://bucket-only")
 
 
-def test_dataset_inputs_are_not_supported_yet():
+def test_a_dataset_input_is_an_s3_key_like_a_file():
     pipeline = PIPELINES["ngiab-simulation"].model_copy(deep=True)
     pipeline.inputs[3] = Port(name="hydrofabric", type="dataset", data="hydrofabric-v2.2")
-    with pytest.raises(UnsupportedForOgc, match="a dataset comes from a registered data lego, not from the caller"):
-        process_description(pipeline, LEGO_LIST)
+    schema = process_description(pipeline, LEGO_LIST)["inputs"]["hydrofabric"]["schema"]
+    assert schema == {"type": "string", "format": "uri", "pattern": S3_URI}
 
 
 def test_step_defaults_the_pipeline_does_not_expose_stay_hidden():
