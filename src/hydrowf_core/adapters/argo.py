@@ -5,6 +5,11 @@ its argument list filled in (ToolLego.argv). File and directory ports become Arg
 - a pipeline input is an s3://<bucket>/<key> URL; Argo reads the key from its default artifact
   repository (the bucket is not passed on)
 - a link between steps is `from: {{tasks.<step>.outputs.artifacts.<output>}}`
+- a registered data lego as a step input (DataSource): external data gives a dataset port of a
+  network tool its URL (the tool reads it in place); managed STAC data is staged from its `location` key
+  for a file or directory port. Iceberg data has no driver here yet. A caller's own dataset URLs are
+  never taken: datasets come from registered data legos
+- no workflow is named `managed`: its outputs would land under managed/, where managed data lives
 - a tool's `files` are raw artifacts
 - an output is stored as files (archive: none), unless its data lego's storage says archive: tgz, in
   which case Argo packs it into one .tgz (its default). Files get an explicit key under
@@ -30,9 +35,10 @@ import json
 import re
 from collections.abc import Callable, Iterable, Mapping
 
-from hydrowf_core.models.lego import (DataLego, DataSource, Lego, Link, Pipeline, PipelineInput, Port, Scalar,
-                                      StacStorage, Step, ToolLego, Value, chosen_format, fill, format_name,
-                                      value_problem)
+from hydrowf_core.models.lego import (MANAGED_PREFIX, DataLego, DataSource, ExternalStorage, Lego, Link, Pipeline,
+                                      PipelineInput, Port, Scalar, StacStorage, Step, ToolLego, Value, chosen_format,
+                                      fill, format_name, value_problem)
+from hydrowf_core.registry.validate import data_source_problem
 
 FILE_TYPES = ("file", "directory")
 RUN_NAME = "{{workflow.name}}"          # {run}: Argo puts the workflow's name here when the pod starts
@@ -100,28 +106,55 @@ def pipeline_values(pipeline: Pipeline, inputs: Mapping[str, Scalar]) -> dict[st
         elif port.type in FILE_TYPES:
             s3_key(value)
         elif port.type == "dataset":
-            raise UnsupportedForArgo(f"input {port.name}: dataset inputs need a data driver")
+            raise UnsupportedForArgo(f"input {port.name}: a dataset comes from a registered data lego "
+                                     "({data: {id, version}} in the pipeline), not from the caller")
         elif problem := value_problem(port.type, port.symbols, value, port.pattern):
             raise BadInputs(f"input {port.name}: {problem}")
         values[port.name] = value
     return values
 
 
-def task_inputs(step: Step, tool: ToolLego,
-                values: dict[str, Scalar | None]) -> tuple[dict[str, Scalar | None], dict[str, dict]]:
+def data_source(step: Step, tool: ToolLego, port: Port, src: DataSource,
+                data: Mapping[tuple[str, str], DataLego]) -> tuple[str | None, dict | None]:
+    """What a registered data lego gives `port`: (a value, None) or (None, an artifact source). The same
+    rules as registry.check, checked again here: an external URL is the one thing anyone may publish that
+    reaches a container's command line."""
+    where = f"step {step.name}.{port.name}"
+    lego = data.get(src.data.key())
+    if lego is None:
+        raise UnsupportedForArgo(f"{where}: {src.data.id}@{src.data.version} is not a registered data lego")
+    problem = data_source_problem(port, src, {src.data.key(): lego}, tool)
+    if problem:
+        raise UnsupportedForArgo(f"{where}: {problem}")
+    storage = lego.storage
+    if isinstance(storage, ExternalStorage):
+        return storage.url, None                                 # read in place by the tool
+    if isinstance(storage, StacStorage):
+        return None, {"s3": {"key": storage.location}}           # staged like an s3:// pipeline input
+    raise UnsupportedForArgo(f"{where}: {lego.id} is {storage.driver} data: Argo has no driver for it yet")
+
+
+def task_inputs(step: Step, tool: ToolLego, values: dict[str, Scalar | None],
+                data: Mapping[tuple[str, str], DataLego] | None = None
+                ) -> tuple[dict[str, Scalar | None], dict[str, dict]]:
     """Where each of the tool's inputs comes from, for one step.
 
     Returns (scalars, artifacts):
     - scalars: input name -> value, for every non-file input (unset optional ones as None)
     - artifacts: input name -> Argo artifact source, for file/directory inputs that have one:
-      {"s3": {"key": ...}} from a pipeline input, {"from": "{{tasks...}}"} from a link
+      {"s3": {"key": ...}} from a pipeline input or a managed data lego, {"from": "{{tasks...}}"} from a link
     """
     scalars: dict[str, Scalar | None] = {}
     artifacts: dict[str, dict] = {}
     for port in tool.inputs:                      # the ports, so unconnected ones get their default
         src = step.inputs.get(port.name)
         if isinstance(src, DataSource):
-            raise UnsupportedForArgo(f"step {step.name}.{port.name}: dataset inputs need a data driver")
+            value, artifact = data_source(step, tool, port, src, data or {})
+            if artifact is not None:
+                artifacts[port.name] = artifact
+            else:
+                scalars[port.name] = value
+            continue
         if isinstance(src, Link):
             artifacts[port.name] = {"from": f"{{{{tasks.{src.step}.outputs.artifacts.{k8s_name(src.output)}}}}}"}
             continue
@@ -270,6 +303,8 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
     Deleting the workflow deletes its output artifacts and archived logs too (artifactGC). With
     `keep_days`, Argo deletes the workflow, and so its outputs, that many days after it finishes.
     """
+    if name == MANAGED_PREFIX.rstrip("/"):
+        raise ValueError(f"a workflow can't be named {name!r}: its outputs would land under {MANAGED_PREFIX}")
     if keep_days is not None and (isinstance(keep_days, bool) or not isinstance(keep_days, int)
                                   or not 1 <= keep_days <= MAX_KEEP_DAYS):
         raise ValueError(f"keep_days={keep_days!r}: a whole number of days, 1 to {MAX_KEEP_DAYS}")
@@ -279,6 +314,7 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
     legos = list(legos)
     tools = {(x.id, x.version): x for x in legos if isinstance(x, ToolLego)}
     archives = output_archives(legos)
+    data = {(x.id, x.version): x for x in legos if isinstance(x, DataLego)}
     values = pipeline_values(pipeline, inputs)
     steps = {s.name: s for s in pipeline.steps}
     templates, tasks = [], []
@@ -289,7 +325,7 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
             raise UnsupportedForArgo(f"step {step_name}: {step.tool.id}@{step.tool.version} is not a registered tool")
         if "argo" not in tool.runs_on:
             raise UnsupportedForArgo(f"step {step_name}: {tool.id} does not run on argo")
-        scalars, artifacts = task_inputs(step, tool, values)
+        scalars, artifacts = task_inputs(step, tool, values, data)
         templates.append(container_template(step, tool, scalars, artifacts, entrypoint, archives))
         task: dict = {"name": step_name, "template": f"step-{step_name}"}
         deps = sorted({src.step for src in step.inputs.values() if isinstance(src, Link)})

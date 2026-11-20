@@ -48,7 +48,7 @@ def test_s3_pattern_accepts_any_bucket_and_rejects_other_schemes():
 def test_dataset_inputs_are_not_supported_yet():
     pipeline = PIPELINES["ngiab-simulation"].model_copy(deep=True)
     pipeline.inputs[3] = Port(name="hydrofabric", type="dataset", data="hydrofabric-v2.2")
-    with pytest.raises(UnsupportedForOgc, match="dataset inputs need a data driver"):
+    with pytest.raises(UnsupportedForOgc, match="a dataset comes from a registered data lego, not from the caller"):
         process_description(pipeline, LEGO_LIST)
 
 

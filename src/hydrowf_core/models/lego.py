@@ -8,8 +8,8 @@ A Port of type file/directory names the DataLego id it carries, so the canvas on
 matching ports. Storage specs are generic (iceberg / stac / external): the platform knows kinds
 of data, never domains.
 
-Not modelled here on purpose: who may create what (backend authorization: tool-authors /
-data-authors create managed data and deploy tools; anyone may add external data).
+Not modelled here on purpose: who may create what (backend authorization, hydrowf-registry: the
+tool-authors group creates managed data and deploys tools; anyone signed in may add external data).
 
 """
 from __future__ import annotations
@@ -144,6 +144,22 @@ class IcebergStorage(Strict):
     tables: dict[str, TableSpec]
 
 
+MANAGED_PREFIX = "managed/"
+PLAIN_KEY = re.compile(r"[A-Za-z0-9._/-]+")   # no {{ }} (Argo expands them in keys), no spaces or escapes
+
+
+def managed_key(key: str | None) -> str | None:
+    """`key` if it is a plain key under managed/ with no empty, `.` or `..` part."""
+    if key is None:
+        return None
+    parts = key.removesuffix("/").split("/")
+    if not key.startswith(MANAGED_PREFIX) or not PLAIN_KEY.fullmatch(key) or len(parts) < 2 \
+            or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"location {key!r}: a key under {MANAGED_PREFIX} (A-Z a-z 0-9 . _ / - only, "
+                         "with no empty, . or .. part)")
+    return key
+
+
 class StacStorage(Strict):
     driver: Literal["stac"]
     format: Literal["cog", "zarr", "geoparquet", "parquet", "netcdf", "other"]
@@ -156,6 +172,23 @@ class StacStorage(Strict):
     archive: Literal["none", "tgz"] = "none"
     item_from: str | None = "manifest.json"   # per-file metadata the producing tool writes
     properties: dict[str, str] = {}       # STAC property -> manifest / run field
+    # managed data only: where the platform keeps it in the artifact bucket, a key under managed/ (a file,
+    # or a folder ending in "/"). Job outputs live under <workflow name>/, so no job writes there.
+    location: Annotated[str | None, Field(max_length=1024), AfterValidator(managed_key)] = None
+
+
+URL_SYNTAX = re.compile(r"[{}$\s\x00-\x1f\x7f-\x9f]")   # Argo's {{ }}, Kubernetes' $(VAR), spaces, controls
+
+
+def plain_url(url: str) -> str:
+    """`url` if a command line can carry it as is: a tool gets an external URL in its args or env, where
+    Argo expands {{...}} and Kubernetes $(VAR). Percent-encode such characters instead."""
+    if URL_SYNTAX.search(url):
+        raise ValueError("the URL may not hold {, }, $, spaces or control characters (percent-encode them)")
+    return url
+
+
+INTERNAL_SUFFIXES = (".local", ".internal", ".cluster.local", ".svc", ".lan", ".home.arpa")
 
 
 def public_host(url: str) -> str:
@@ -163,11 +196,15 @@ def public_host(url: str) -> str:
     literals that are loopback, private, link-local (e.g. 169.254.169.254, cloud metadata), reserved,
     multicast or unspecified. A first line of defense only: a public name can still resolve to an
     internal address, so whatever fetches the URL must check the address it connects to."""
-    host = urlsplit(url).hostname
+    host = (urlsplit(url).hostname or "").rstrip(".")     # a.svc.cluster.local. is a.svc.cluster.local
     if not host:
         raise ValueError("the URL needs a host")
     if host == "localhost" or host.endswith(".localhost"):
         raise ValueError(f"{host} is not a public host")
+    # https: names a cluster or a LAN resolves (minio, *.svc.cluster.local, *.internal) aren't public.
+    # s3:// names a bucket here, often one label (noaa-nwm-retrospective-3-0-pds): no rule for it.
+    if url.startswith("https://") and ("." not in host or host.endswith(INTERNAL_SUFFIXES)):
+        raise ValueError(f"{host} is not a public host name")
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
@@ -183,7 +220,8 @@ def public_host(url: str) -> str:
 
 class ExternalStorage(Strict):
     driver: Literal["external"]
-    url: Annotated[str, Field(pattern=r"^(s3|https)://", max_length=2048), AfterValidator(public_host)]
+    url: Annotated[str, Field(pattern=r"^(s3|https)://", max_length=2048), AfterValidator(plain_url),
+                   AfterValidator(public_host)]
     format: Literal["zarr", "netcdf", "parquet", "cog", "api", "other"]
     access: Literal["anonymous"] = "anonymous"              # v1: no stored credentials
 
@@ -200,6 +238,11 @@ class DataLego(LegoBase):
     def external_means_external_storage(self) -> DataLego:
         if (self.data_kind == "external") != isinstance(self.storage, ExternalStorage):
             raise ValueError("data_kind 'external' goes with driver 'external', and only with it")
+        if isinstance(self.storage, StacStorage):
+            if self.data_kind == "managed" and self.storage.location is None:
+                raise ValueError("managed STAC data needs a `location` (where the platform keeps it)")
+            if self.data_kind == "output" and self.storage.location is not None:
+                raise ValueError("output data has no `location`: each run writes its own")
         return self
 
 

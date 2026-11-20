@@ -7,6 +7,11 @@ The models validate each lego on its own. What needs other legos is here:
 - each source fits its port: same kind (scalar type, file, directory, dataset) and same data lego id
   (an input with a default may stay unconnected); a link carries the format its step chose
 - a step's format choices name outputs that list formats, and one of their formats
+- a data lego feeds a port its driver can serve: external data a dataset port of a tool that declares
+  `network: true` (the tool reads the URL in place); managed STAC data a file or directory port (staged
+  from its `location`: a key ending in "/" is a directory); Iceberg data a dataset port (no runtime
+  adapter reads it yet: render refuses it, check doesn't, since a pipeline's wiring doesn't depend on
+  the runtime)
 
 Returns a list of problems instead of raising on the first one, so a form can show them all.
 """
@@ -14,8 +19,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from hydrowf_core.models.lego import (DataLego, DataSource, Lego, Link, Pipeline, PipelineInput, Port, Step,
-                                      ToolLego, Value, chosen_format, value_problem)
+from hydrowf_core.models.lego import (DataLego, DataSource, ExternalStorage, Lego, Link, Pipeline, PipelineInput,
+                                      Port, StacStorage, Step, ToolLego, Value, chosen_format, value_problem)
 
 
 def check(legos: Iterable[Lego]) -> list[str]:
@@ -63,7 +68,7 @@ def check_pipeline(p: Pipeline, by_key: dict[tuple[str, str], Lego]) -> list[str
                 if not port.optional and port.default is None:
                     problems.append(f"{where}: step {s.name}: required input {name!r} is not connected")
                 continue
-            problem = source_problem(port, src, pipeline_inputs, tools, by_key, steps)
+            problem = source_problem(port, src, pipeline_inputs, tools, by_key, steps, tool)
             if problem:
                 problems.append(f"{where}: step {s.name}.{name}: {problem}")
 
@@ -72,6 +77,43 @@ def check_pipeline(p: Pipeline, by_key: dict[tuple[str, str], Lego]) -> list[str
         if tool and link.output not in {port.name for port in tool.outputs}:
             problems.append(f"{where}: output {out}: {tool.id} has no output {link.output!r}")
     return problems
+
+
+def data_source_problem(port: Port, src: DataSource, by_key: dict[tuple[str, str], Lego],
+                        tool: ToolLego) -> str | None:
+    """Why the data lego `src` names can't feed `port` of `tool` (see the module docstring)."""
+    if port.type not in ("file", "directory", "dataset"):
+        return f"a {port.type} port can't take a data lego"
+    data = by_key.get(src.data.key())
+    if not isinstance(data, DataLego):
+        return f"{src.data.id}@{src.data.version} is not a registered data lego"
+    if port.data != data.id:
+        return f"data lego {data.id} doesn't fit a port of {port.data}"
+    storage = data.storage
+    if isinstance(storage, ExternalStorage):
+        if port.type != "dataset":
+            return f"external data {data.id} is read in place: it feeds a dataset port, not a {port.type} port"
+        if not tool.network:
+            return f"external data {data.id} is read from the internet: {tool.id} must declare network: true"
+        return None
+    if isinstance(storage, StacStorage) and storage.location is not None:
+        return managed_problem(data.id, storage.location, port.type)
+    if isinstance(storage, StacStorage):
+        return f"{data.id} is output data: a run's output is passed as a link or an s3:// input, not by id"
+    if port.type != "dataset":                           # Iceberg: tables, read in place
+        return f"{storage.driver} data {data.id} is read in place: it feeds a dataset port, not a {port.type} port"
+    return None                                          # whether a runtime can read it is the adapter's call
+
+
+def managed_problem(data_id: str, location: str, port_type: str) -> str | None:
+    """Why managed data at `location` can't feed a `port_type` port: Argo stages it, with its own
+    credentials, as the file or directory the location names; tools have no credentials for the bucket."""
+    if port_type == "dataset":
+        return f"managed data {data_id} is staged: it feeds a file or directory port, not a dataset port"
+    kind = "directory" if location.endswith("/") else "file"
+    if kind != port_type:
+        return f"managed data {data_id} is a {kind} ({location}), the port wants a {port_type}"
+    return None
 
 
 def format_problems(step: Step, tool: ToolLego) -> list[str]:
@@ -92,17 +134,12 @@ def format_problems(step: Step, tool: ToolLego) -> list[str]:
 
 def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
                    pipeline_inputs: dict[str, Port], tools: dict[str, ToolLego],
-                   by_key: dict[tuple[str, str], Lego], steps: dict[str, Step]) -> str | None:
-    """Why `src` can't feed `port`, or None if it can."""
+                   by_key: dict[tuple[str, str], Lego], steps: dict[str, Step], tool: ToolLego) -> str | None:
+    """Why `src` can't feed `port` of `tool`, or None if it can."""
     if isinstance(src, Value):
         return value_problem(port.type, port.symbols, src.value, port.pattern)
     if isinstance(src, DataSource):
-        data = by_key.get(src.data.key())
-        if not isinstance(data, DataLego):
-            return f"{src.data.id}@{src.data.version} is not a registered data lego"
-        if port.type != "dataset" or port.data != data.id:
-            return f"data lego {data.id} fits a dataset port of {data.id}, not a {port.type} port of {port.data}"
-        return None
+        return data_source_problem(port, src, by_key, tool)
     if isinstance(src, PipelineInput):
         upstream = pipeline_inputs[src.input]          # declared: the Pipeline model checked it
         what = f"pipeline input {src.input}"
