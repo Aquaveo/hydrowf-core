@@ -77,8 +77,8 @@ def test_without_an_entrypoint_argo_looks_it_up():
     assert "command" not in run and run["args"][1:] == ["auto", "4", "local"]
 
 
-def test_dataset_inputs_need_a_data_driver():
-    with pytest.raises(UnsupportedForArgo, match="dataset inputs need a data driver"):
+def test_iceberg_data_has_no_argo_driver():
+    with pytest.raises(UnsupportedForArgo, match="hydrofabric-v2.2 is iceberg data: Argo has no driver for it"):
         render(PIPELINES["ngiab-prepare"], LEGO_LIST, {"outlet": "gage-1", "start": "a", "end": "b"})
 
 

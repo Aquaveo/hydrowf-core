@@ -1,6 +1,6 @@
 # Step 3: tool-declared formats and data legos as inputs
 
-Status: agreed (2026-11-20); PR 1 (formats) in progress. Part of the data MVP:
+Status: agreed (2026-11-20); PR 1 (formats) merged (#16); PR 2 (data drivers) in progress. Part of the data MVP:
 
 | Step | What | State |
 |---|---|---|
@@ -101,8 +101,8 @@ What can feed a step input today, and what step 3 adds:
 | Pipeline file/directory input (an `s3://` URL) | file, directory | yes: an earlier job's output or a key under `shared_inputs` | **the URL's data must match the port's** (3.3) |
 | Link to another step's output | file, directory | yes | uses the chosen format (2.2) |
 | `DataSource` of an **external** data lego | dataset | refused | **the tool gets the URL** (3.1) |
-| `DataSource` of a **managed STAC** data lego | file, directory, dataset | refused | **staged or passed by URL** (3.2) |
-| `DataSource` of an Iceberg data lego | dataset | refused | still refused (Iceberg driver later) |
+| `DataSource` of a **managed STAC** data lego | file, directory | refused | **staged from its location** (3.2) |
+| `DataSource` of an Iceberg data lego | dataset | refused | `check()` accepts the wiring; `render()` refuses (no Argo driver yet) |
 
 ### 3.1 External driver
 
@@ -111,9 +111,13 @@ private, loopback and link-local hosts). For a `dataset` port fed by an external
 
 - render passes the data lego's `url` as the input's value (`{name}` in args/env). Nothing is copied:
   the tool reads it in place, as the Port docstring says datasets are.
-- `check()`: the tool must have `network: true` (it reads from the internet), else a problem.
+- `check()` and render refuse external data to a tool without `network: true` (it reads from the
+  internet). Nothing stops a `network: false` tool from reaching the network at run time until the new
+  cluster's egress policy exists.
+- The URL may not hold `{`, `}`, `$`, spaces or control characters (Argo expands `{{...}}` and Kubernetes
+  `$(VAR)` in args and env): anyone may publish external data, so its URL is checked like caller text.
 - The URL comes from the registry, never from the caller: a caller can't point a tool at an address of
-  their choosing. (Caller-given dataset URLs stay refused; see open question 1.)
+  their choosing. (Caller-given dataset URLs stay refused: decision 1.)
 
 ### 3.2 STAC driver for managed data
 
@@ -122,11 +126,18 @@ A managed STAC data lego is data the platform keeps (today the conus hydrofabric
 
 - `StacStorage.location: str | None`: for `data_kind: managed`, the key it lives at in the artifact
   bucket (a file key or a prefix ending in `/`), e.g. `managed/hydrofabric-gpkg/2.2.0/conus_nextgen.gpkg`.
-  Required for managed STAC data, refused for output data (an output's key is per run). Checked with the
-  same rule as input keys (`clean_key`).
+  Required for managed STAC data, refused for output data (an output's key is per run). It must be a plain
+  key **under `managed/`** (A-Z a-z 0-9 . _ / -, no empty, `.` or `..` part): job outputs live under
+  `<workflow name>/`, so a managed location can never point into a job's outputs.
 - A `DataSource` of such a lego feeds a file or directory port by **staging** (an Argo artifact from that
-  key, as a pipeline file input is today) and a dataset port by its `s3://` URL.
-- Who may publish managed data stays as decided: `tool-authors`/`data-authors` only. Getting the bytes to
+  key, as a pipeline file input is today). The key's form says which: ending in `/` is a directory, else a
+  file; `check()` refuses a mismatch.
+- **Not a dataset port.** Staging uses Argo's credentials; tool pods have none for the platform bucket, so
+  an `s3://` URL to managed data couldn't be read. Giving tools read access to the bucket is a trust
+  decision for later (it would let any tool read every managed key).
+- render refuses a workflow named `managed`: its outputs (`<workflow name>/...`) would land under
+  `managed/`. hydrowf-ogc's job ids are UUIDs, but render is a public API.
+- Who may publish managed data stays as decided: `tool-authors` only (hydrowf-registry). Getting the bytes to
   `location` is an admin task for now (uploads come later).
 - hydrowf-ogc then needs fewer `shared_inputs`: pipelines name `{data: {id: hydrofabric-gpkg, version: 2.2.0}}`
   instead of asking every caller for the URL. `shared_inputs` stays for older pipelines.
@@ -168,23 +179,30 @@ mechanism to exist (it is tested with fixture legos).
 - **Deploy order:** the models forbid unknown fields, so a service pinned to an older core can't load a
   lego that uses `formats`. Bump the core pin in hydrowf-ogc and hydrowf-registry before any such lego is
   published.
+- **Stricter data legos (PR 2):** managed STAC data now needs a `location`, and an external URL may not hold
+  `{ } $`, whitespace or control characters, nor name an internal https host. A lego that validated before
+  and breaks one of these is left out of hydrowf-ogc's registry snapshot (logged). None in today's
+  registries does.
 
 ## 6. Security notes
 
 - Formats are chosen in the pipeline lego, not per request: a caller can't change what a tool writes.
 - External URLs only come from registered data legos (`public_host`, anonymous). The tool must declare
-  `network: true`. A public name can still resolve to an internal address; the new cluster's egress
-  policy is the real fence (noted in the deploy work).
-- Managed `location` keys pass `clean_key`; staging uses Argo's own credentials, as pipeline file inputs
-  do today, so a managed data lego must never point into a job's prefix (`location` must not start with a
-  job-name-like first part; checked).
+  `network: true` (checked in `check()` and again in render). For `https://` URLs, `public_host` also
+  refuses one-label names and cluster/LAN suffixes (`.local`, `.internal`, `.cluster.local`, `.svc`,
+  `.lan`, `.home.arpa`); for `s3://` the "host" is a bucket name and isn't checked. A public name can
+  still resolve to an internal address; the new cluster's egress policy is the real fence (noted in the
+  deploy work).
+- Managed `location` keys are plain keys under `managed/`; staging uses Argo's own credentials, as pipeline
+  file inputs do today, and no job writes under `managed/` (job keys start with the workflow name, and
+  render refuses the name `managed`).
 
 ## 7. Work breakdown
 
 | PR | Repo | Contents | Depends on |
 |---|---|---|---|
 | 1 | hydrowf-core | `Port.formats`, `Step.formats`, `{<output>_format}`, checks, render, `hydrowf/formats`, `output_formats` | |
-| 2 | hydrowf-core | external and managed-STAC drivers (`DataSource`, dataset ports, `StacStorage.location`), OGC descriptions for dataset inputs | 1 |
+| 2 | hydrowf-core | external and managed-STAC drivers (`DataSource`, external on dataset ports, managed staged, `StacStorage.location`); caller dataset inputs stay refused | 1 |
 | 3 | hydrowf-ogc | pin core; results read `hydrowf/formats`; inputs checked against their data (3.3); registry legos updated | 1, 2 |
 | 4 | hydrowf-tools | ngiab-to-cng 0.3.0 (configs), cng-to-ngen 0.1.0, round-trip test | |
 | 5 | hydrowf-ogc | pin the two new images; `ngen-cng@2.0.0`; a pipeline that reruns from CNG | 3, 4 |

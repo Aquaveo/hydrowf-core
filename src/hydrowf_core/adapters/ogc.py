@@ -77,7 +77,8 @@ def process_description(pipeline: Pipeline, legos: Iterable[Lego]) -> dict:
     inputs = {}
     for port in pipeline.inputs:
         if port.type == "dataset":
-            raise UnsupportedForOgc(f"input {port.name}: dataset inputs need a data driver")
+            raise UnsupportedForOgc(f"input {port.name}: a dataset comes from a registered data lego, "
+                                    "not from the caller")
         schema = port_schema(port)
         if port.type == "string":             # file ports keep port_schema's s3:// pattern
             schema.pop("pattern", None)

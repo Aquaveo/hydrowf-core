@@ -73,7 +73,7 @@ def test_cycles_are_rejected(change):
      "subset.region is file of hydrofabric-gpkg, the port wants string"),
     (lambda p: step(p, "preprocess")["inputs"].update(
         hydrofabric={"data": {"id": "hydrofabric-v2.2", "version": "1.0.0"}}),
-     "fits a dataset port of hydrofabric-v2.2, not a file port of hydrofabric-gpkg"),
+     "data lego hydrofabric-v2.2 doesn't fit a port of hydrofabric-gpkg"),
     (lambda p: p["outputs"].update(run={"step": "preprocess", "output": "nope"}), "has no output 'nope'"),
 ])
 def test_registry_check_reports_mismatches(change, message):
