@@ -6,6 +6,11 @@ its argument list filled in (ToolLego.argv). File and directory ports become Arg
   repository (the bucket is not passed on)
 - a link between steps is `from: {{tasks.<step>.outputs.artifacts.<output>}}`
 - a tool's `files` are raw artifacts
+- an output is stored as files (archive: none), unless its data lego's storage says archive: tgz, in
+  which case Argo packs it into one .tgz (its default). Files get an explicit key under
+  {{workflow.name}}/{{pod.name}}/<output>/: a directory's ends in "/", because Argo's artifact GC deletes
+  the files under a key only when it does (workflow/artifacts/s3/s3.go, v4.1.6), and a file's keeps its
+  file name (its extension)
 - {run} in args and env becomes {{workflow.name}}, which Argo fills when the pod starts
 
 What running on Argo v4.1.6 taught us (hydrowf-platform docs/argo-findings.md):
@@ -21,8 +26,8 @@ import json
 import re
 from collections.abc import Callable, Iterable, Mapping
 
-from hydrowf_core.models.lego import (DataSource, Lego, Link, Pipeline, PipelineInput, Scalar, Step, ToolLego, Value,
-                                      fill, value_problem)
+from hydrowf_core.models.lego import (DataLego, DataSource, Lego, Link, Pipeline, PipelineInput, Port, Scalar,
+                                      StacStorage, Step, ToolLego, Value, fill, value_problem)
 
 FILE_TYPES = ("file", "directory")
 RUN_NAME = "{{workflow.name}}"          # {run}: Argo puts the workflow's name here when the pod starts
@@ -147,8 +152,40 @@ def resources(tool: ToolLego) -> dict:
     return {"requests": requests, "limits": {"memory": requests["memory"]}}
 
 
+def output_archives(legos: Iterable[Lego]) -> dict[str, str]:
+    """Data lego id -> how its outputs are stored ("none" or "tgz"), from the latest version of each
+    data lego with STAC storage. An output whose data isn't here is stored as files."""
+    latest: dict[str, DataLego] = {}
+    for lego in legos:
+        if isinstance(lego, DataLego) and isinstance(lego.storage, StacStorage):
+            current = latest.get(lego.id)
+            if current is None or semver(lego.version) > semver(current.version):
+                latest[lego.id] = lego
+    return {id: lego.storage.archive for id, lego in latest.items()}
+
+
+def semver(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))      # SemVer: at most 32 characters
+
+
+OUTPUT_PREFIX = "{{workflow.name}}/{{pod.name}}"     # the artifact repository's default key format
+
+
+def output_artifact(port: Port, path: str, archives: Mapping[str, str]) -> dict:
+    name = k8s_name(port.name)
+    artifact = {"name": name, "path": path}
+    if archives.get(port.data or "", "none") == "tgz":
+        return artifact                         # Argo's default: one <name>.tgz under OUTPUT_PREFIX
+    artifact["archive"] = {"none": {}}          # each file its own object
+    if port.type == "directory":                # the trailing "/" makes artifact GC delete the files
+        artifact["s3"] = {"key": f"{OUTPUT_PREFIX}/{name}/"}
+    else:                                       # its own folder: two outputs can share a file name
+        artifact["s3"] = {"key": f"{OUTPUT_PREFIX}/{name}/{path.rsplit('/', 1)[-1]}"}
+    return artifact
+
+
 def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | None], staged: Iterable[str],
-                       entrypoint: Entrypoint | None) -> dict:
+                       entrypoint: Entrypoint | None, archives: Mapping[str, str] | None = None) -> dict:
     """One step's Argo template: stage inputs and files under the workdir, run, collect outputs."""
     runtime = {**scalars, "workdir": tool.workdir, "cpu": tool.cpu, "run": RUN_NAME}
 
@@ -178,7 +215,7 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
     return {
         "name": f"step-{step.name}",
         "inputs": {"artifacts": in_artifacts},
-        "outputs": {"artifacts": [{"name": k8s_name(p.name), "path": at(p.path)}
+        "outputs": {"artifacts": [output_artifact(p, at(p.path), archives or {})
                                   for p in tool.outputs if p.type in FILE_TYPES]},
         "volumes": [{"name": "work", "emptyDir": {}}],
         "container": container,
@@ -206,7 +243,9 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
     extra = check_labels(labels or {})
     if reserved := sorted(set(extra) & set(RESERVED_LABELS)):
         raise ValueError(f"{', '.join(reserved)}: render() sets these labels itself")
+    legos = list(legos)
     tools = {(x.id, x.version): x for x in legos if isinstance(x, ToolLego)}
+    archives = output_archives(legos)
     values = pipeline_values(pipeline, inputs)
     steps = {s.name: s for s in pipeline.steps}
     templates, tasks = [], []
@@ -218,7 +257,7 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
         if "argo" not in tool.runs_on:
             raise UnsupportedForArgo(f"step {step_name}: {tool.id} does not run on argo")
         scalars, artifacts = task_inputs(step, tool, values)
-        templates.append(container_template(step, tool, scalars, artifacts, entrypoint))
+        templates.append(container_template(step, tool, scalars, artifacts, entrypoint, archives))
         task: dict = {"name": step_name, "template": f"step-{step_name}"}
         deps = sorted({src.step for src in step.inputs.values() if isinstance(src, Link)})
         if deps:

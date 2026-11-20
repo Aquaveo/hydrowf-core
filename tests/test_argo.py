@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hydrowf_core.adapters.argo import BadInputs, UnsupportedForArgo, render, resources
-from hydrowf_core.models import LEGOS, Pipeline, ToolLego
+from hydrowf_core.adapters.argo import BadInputs, UnsupportedForArgo, output_archives, render, resources
+from hydrowf_core.models import LEGOS, DataLego, Pipeline, ToolLego
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LEGO_LIST = LEGOS.validate_python(yaml.safe_load((FIXTURES / "legos.yaml").read_text()))
@@ -194,3 +194,75 @@ def test_caller_labels_join_renders_own():
 def test_caller_labels_are_checked(labels, message):
     with pytest.raises(ValueError, match=message):
         render(PIPELINES["ngiab-simulation"], LEGO_LIST, INPUTS, ENTRYPOINTS.get, labels=labels)
+
+
+# ---- how outputs are stored: their data lego's archive (none: files; tgz: one .tgz)
+
+
+def outputs_of(workflow):
+    """step template -> {output artifact name: its archive setting, or None for Argo's default (.tgz)}"""
+    return {t["name"]: {a["name"]: a.get("archive") for a in t["outputs"]["artifacts"]}
+            for t in workflow["spec"]["templates"] if "container" in t}
+
+
+def output_keys(workflow):
+    """step template -> {output artifact name: its explicit S3 key, or None for the repository default}"""
+    return {t["name"]: {a["name"]: (a.get("s3") or {}).get("key") for a in t["outputs"]["artifacts"]}
+            for t in workflow["spec"]["templates"] if "container" in t}
+
+
+def with_archive(data_id, archive, version=None):
+    """The fixture legos with `data_id`'s storage set to `archive` (as a new version when given)."""
+    changed = []
+    for lego in LEGO_LIST:
+        if isinstance(lego, DataLego) and lego.id == data_id:
+            storage = lego.storage.model_copy(update={"archive": archive})
+            new = lego.model_copy(update={"storage": storage, **({"version": version} if version else {})})
+            changed += [lego, new] if version else [new]
+        else:
+            changed.append(lego)
+    return changed
+
+
+def test_outputs_are_files_unless_their_data_says_tgz():
+    outputs = outputs_of(simulation())
+    assert outputs["step-run"] == {"ngen-run": None}                       # ngen-run: archive: tgz
+    assert outputs["step-to-cng"] == {"cng": {"none": {}}}                 # ngen-cng: the default, files
+
+
+def test_a_data_lego_without_archive_means_files():
+    legos = with_archive("ngen-run", "none")
+    workflow = render(PIPELINES["ngiab-simulation"], legos, INPUTS, ENTRYPOINTS.get)
+    assert outputs_of(workflow)["step-run"] == {"ngen-run": {"none": {}}}
+
+
+def test_the_latest_version_of_a_data_lego_decides():
+    nine = with_archive("ngen-cng", "none", version="9.0.0")
+    ten = with_archive("ngen-cng", "tgz", version="10.0.0")
+    newer = [x for x in ten if x.id == "ngen-cng" and x.version == "10.0.0"]
+    older = [x for x in nine if not (x.id == "ngen-cng" and x.version == "10.0.0")]
+    legos = newer + older                                   # the newest first: order doesn't decide
+    assert output_archives(legos)["ngen-cng"] == "tgz"      # 10.0.0 > 9.0.0 as numbers (not as text)
+    workflow = render(PIPELINES["ngiab-simulation"], legos, INPUTS, ENTRYPOINTS.get)
+    assert outputs_of(workflow)["step-to-cng"] == {"cng": None}
+
+
+def test_archive_is_none_or_tgz():
+    with pytest.raises(ValueError, match="none|tgz"):
+        LEGOS.validate_python([{"kind": "data", "id": "d", "version": "1.0.0", "title": "d", "data_kind": "output",
+                                "storage": {"driver": "stac", "format": "other", "archive": "zip"}}])
+
+
+def test_a_directory_output_key_ends_in_a_slash_so_gc_deletes_its_files():
+    keys = output_keys(simulation())
+    assert keys["step-to-cng"] == {"cng": "{{workflow.name}}/{{pod.name}}/cng/"}
+    assert keys["step-run"] == {"ngen-run": None}                          # tgz: the repository default
+
+
+def test_a_file_output_keeps_its_name_in_its_own_folder():
+    from hydrowf_core.adapters.argo import output_artifact
+    from hydrowf_core.models import Port
+    port = Port(name="region", type="file", data="hydrofabric-gpkg", path="out/region.gpkg")
+    artifact = output_artifact(port, "/work/out/region.gpkg", {})
+    assert artifact["s3"] == {"key": "{{workflow.name}}/{{pod.name}}/region/region.gpkg"}
+    assert artifact["archive"] == {"none": {}}
