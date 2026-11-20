@@ -295,6 +295,10 @@ class Port(Strict):
     name: Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]*$")]
     type: Literal["string", "int", "float", "boolean", "enum", "file", "directory", "dataset"]
     data: LegoId | None = None            # file/directory/dataset: the DataLego id this port carries
+    # file/directory outputs that can be written in several formats: the data legos, the first is the
+    # default. Instead of `data`. A pipeline step picks one (Step.formats); the tool reads the choice
+    # from {<name>_format}.
+    formats: Annotated[list[LegoId], Field(max_length=32)] = []
     symbols: list[str] = []               # enum only
     # string only: a regex the whole (ASCII) value must match, run by pydantic on Rust's regex engine.
     # It is also the OGC schema's pattern, so the only (? group is (?:...); Rust refuses lookarounds,
@@ -305,10 +309,24 @@ class Port(Strict):
     path: RelPath | None = None           # file/directory: may use {input} placeholders
     description: str = ""
 
+    @property
+    def choices(self) -> list[str]:
+        """The data legos this port can carry: its formats, or its one `data` (none for scalars)."""
+        return list(self.formats) or ([self.data] if self.data else [])
+
     @model_validator(mode="after")
     def check_port(self) -> Port:
-        if self.type in DATA_TYPES and not self.data:
-            raise ValueError(f"port {self.name}: a {self.type} port needs `data` (a data lego id)")
+        if self.formats:
+            if self.type not in ("file", "directory"):
+                raise ValueError(f"port {self.name}: only file/directory ports list `formats`")
+            if self.data:
+                raise ValueError(f"port {self.name}: `formats` replaces `data`; give one or the other")
+            if len(self.formats) < 2 or len(set(self.formats)) != len(self.formats):
+                raise ValueError(f"port {self.name}: `formats` lists at least two different data legos "
+                                 "(one format is `data`)")
+        if self.type in DATA_TYPES and not self.choices:
+            raise ValueError(f"port {self.name}: a {self.type} port needs `data` (a data lego id; "
+                             "for outputs, or `formats`)")
         if self.type not in DATA_TYPES and self.data:
             raise ValueError(f"port {self.name}: only file/directory/dataset ports carry `data`")
         if (self.type == "enum") != bool(self.symbols):
@@ -368,6 +386,14 @@ class ToolLego(LegoBase):
         for name in RUNTIME_NAMES:
             if name in inputs:
                 raise ValueError(f"input {name!r}: the name is reserved for the runtime")
+        for port in self.inputs:
+            if port.formats:
+                raise ValueError(f"input {port.name}: only outputs list `formats`; an input takes one `data`")
+        choices = {format_name(p.name): p for p in self.outputs if p.formats}   # {<output>_format}
+        for name in choices:
+            if name in inputs:
+                raise ValueError(f"input {name!r}: the name is reserved for the format of output "
+                                 f"{choices[name].name!r}")
         for port in self.outputs:
             if port.type in ("file", "directory") and port.path is None:
                 raise ValueError(f"output {port.name}: a {port.type} output needs a `path`")
@@ -375,12 +401,22 @@ class ToolLego(LegoBase):
             if PLACEHOLDER.search(word):
                 raise ValueError(f"command {word!r}: placeholders go in `args`, not `command`")
 
-        def check(text: str, where: str, group: str | None = None, in_path: bool = False) -> None:
+        used: set[str] = set()
+
+        def check(text: str, where: str, group: str | None = None, in_path: bool = False,
+                  always: bool = False) -> None:
             for name in PLACEHOLDER.findall(text):
                 if name == "run" and in_path:
                     raise ValueError(f"{where} {text!r}: {{run}} is only known when the run starts; "
                                      "use it in args or env, not in paths")
                 if name in RUNTIME_NAMES:
+                    continue
+                if name in choices:
+                    if in_path:
+                        raise ValueError(f"{where} {text!r}: {{{name}}} is chosen by the pipeline; "
+                                         "use it in args or env, not in paths")
+                    if always:              # an ArgGroup may be left out: the tool would never hear it
+                        used.add(name)
                     continue
                 port = inputs.get(name)
                 if port is None:
@@ -396,21 +432,25 @@ class ToolLego(LegoBase):
                 for word in arg.args:
                     check(word, "args", group=arg.when)
             else:
-                check(arg, "args")
+                check(arg, "args", always=True)
         for key, value in self.env.items():
-            check(value, f"env {key}")
+            check(value, f"env {key}", always=True)
         for port in self.inputs + self.outputs:
             if port.path:
                 check(port.path, f"{port.name} path", in_path=True)
         for path in self.files:
             check(path, "files", in_path=True)
+        if unused := sorted(choices.keys() - used):
+            raise ValueError(f"outputs with formats must tell the tool which one to write: pass "
+                             f"{', '.join(f'{{{name}}}' for name in unused)} in args (not only in a group) or env")
         return self
 
     def argv(self, values: dict[str, Scalar | None]) -> list[str]:
         """The container's arguments for one run.
 
         `values` has every input name (defaults already applied; unset optional inputs as None;
-        file/directory inputs as their absolute paths) plus "workdir", "cpu" and "run". Plain words are
+        file/directory inputs as their absolute paths) plus "workdir", "cpu", "run" and, for each
+        output with formats, "<output>_format". Plain words are
         filled with `fill`; an ArgGroup's words are added (filled) only when values[group.when]
         is neither None nor False.
         """
@@ -461,6 +501,17 @@ class Step(Strict):
     name: StepName
     tool: LegoRef
     inputs: dict[str, Source] = {}        # tool input port name -> where its value comes from
+    formats: dict[str, LegoId] = {}       # tool output port name -> the format it writes (Port.formats)
+
+
+def format_name(output: str) -> str:
+    """The placeholder (and argv value) that tells a tool which format to write to `output`."""
+    return f"{output}_format"
+
+
+def chosen_format(step: Step, port: Port) -> str | None:
+    """The data lego `step` writes to its tool's output `port`: the step's choice, else the first format."""
+    return step.formats.get(port.name) or next(iter(port.choices), None)
 
 
 class Pipeline(LegoBase):
@@ -477,6 +528,9 @@ class Pipeline(LegoBase):
         if len(set(names)) != len(names):
             raise ValueError(f"step names must be unique: {sorted(n for n in set(names) if names.count(n) > 1)}")
         declared = {p.name for p in self.inputs}
+        for port in self.inputs:
+            if port.formats:
+                raise ValueError(f"pipeline input {port.name}: only tool outputs list `formats`")
         for s in self.steps:
             for port, src in s.inputs.items():
                 if isinstance(src, PipelineInput) and src.input not in declared:

@@ -5,7 +5,8 @@ The models validate each lego on its own. What needs other legos is here:
 - a pipeline step's tool exists (at the pinned version) and is a tool
 - every step input is a port of that tool; every required port is given
 - each source fits its port: same kind (scalar type, file, directory, dataset) and same data lego id
-  (an input with a default may stay unconnected)
+  (an input with a default may stay unconnected); a link carries the format its step chose
+- a step's format choices name outputs that list formats, and one of their formats
 
 Returns a list of problems instead of raising on the first one, so a form can show them all.
 """
@@ -13,8 +14,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from hydrowf_core.models.lego import (DataLego, DataSource, Lego, Link, Pipeline, PipelineInput, Port, ToolLego,
-                                      Value, value_problem)
+from hydrowf_core.models.lego import (DataLego, DataSource, Lego, Link, Pipeline, PipelineInput, Port, Step,
+                                      ToolLego, Value, chosen_format, value_problem)
 
 
 def check(legos: Iterable[Lego]) -> list[str]:
@@ -26,9 +27,10 @@ def check(legos: Iterable[Lego]) -> list[str]:
     for lego in legos:
         if isinstance(lego, ToolLego):
             for port in lego.inputs + lego.outputs:
-                if port.data and port.data not in data_ids:
-                    problems.append(f"tool {lego.id}@{lego.version}: port {port.name}: "
-                                    f"unknown data lego {port.data!r}")
+                for data in port.choices:
+                    if data not in data_ids:
+                        problems.append(f"tool {lego.id}@{lego.version}: port {port.name}: "
+                                        f"unknown data lego {data!r}")
         elif isinstance(lego, Pipeline):
             problems += check_pipeline(lego, by_key)
     return problems
@@ -46,10 +48,12 @@ def check_pipeline(p: Pipeline, by_key: dict[tuple[str, str], Lego]) -> list[str
             problems.append(f"{where}: step {s.name}: {s.tool.id}@{s.tool.version} is not a registered tool")
 
     pipeline_inputs = {port.name: port for port in p.inputs}
+    steps = {s.name: s for s in p.steps}
     for s in p.steps:
         tool = tools.get(s.name)
         if tool is None:
             continue
+        problems += [f"{where}: step {s.name}: {problem}" for problem in format_problems(s, tool)]
         ports = {port.name: port for port in tool.inputs}
         for name in sorted(s.inputs.keys() - ports.keys()):
             problems.append(f"{where}: step {s.name}: {tool.id} has no input {name!r}")
@@ -59,7 +63,7 @@ def check_pipeline(p: Pipeline, by_key: dict[tuple[str, str], Lego]) -> list[str
                 if not port.optional and port.default is None:
                     problems.append(f"{where}: step {s.name}: required input {name!r} is not connected")
                 continue
-            problem = source_problem(port, src, pipeline_inputs, tools, by_key)
+            problem = source_problem(port, src, pipeline_inputs, tools, by_key, steps)
             if problem:
                 problems.append(f"{where}: step {s.name}.{name}: {problem}")
 
@@ -70,9 +74,25 @@ def check_pipeline(p: Pipeline, by_key: dict[tuple[str, str], Lego]) -> list[str
     return problems
 
 
+def format_problems(step: Step, tool: ToolLego) -> list[str]:
+    """What is wrong with `step`'s format choices for `tool`."""
+    outputs = {port.name: port for port in tool.outputs}
+    problems = []
+    for output, data in step.formats.items():
+        port = outputs.get(output)
+        if port is None:
+            problems.append(f"formats: {tool.id} has no output {output!r}")
+        elif not port.formats:
+            problems.append(f"formats: output {output!r} of {tool.id} has one format, {port.data!r}")
+        elif data not in port.formats:
+            problems.append(f"formats: output {output!r} of {tool.id} writes {', '.join(port.formats)}, "
+                            f"not {data!r}")
+    return problems
+
+
 def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
                    pipeline_inputs: dict[str, Port], tools: dict[str, ToolLego],
-                   by_key: dict[tuple[str, str], Lego]) -> str | None:
+                   by_key: dict[tuple[str, str], Lego], steps: dict[str, Step]) -> str | None:
     """Why `src` can't feed `port`, or None if it can."""
     if isinstance(src, Value):
         return value_problem(port.type, port.symbols, src.value, port.pattern)
@@ -86,6 +106,7 @@ def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
     if isinstance(src, PipelineInput):
         upstream = pipeline_inputs[src.input]          # declared: the Pipeline model checked it
         what = f"pipeline input {src.input}"
+        data = upstream.data
         if upstream.type == port.type and upstream.default is not None and port.pattern is not None and (
                 problem := value_problem(port.type, port.symbols, upstream.default, port.pattern)):
             return f"{what}'s default {problem}"       # a registry mistake: at load, not on execute
@@ -97,7 +118,8 @@ def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
         if upstream is None:
             return f"{tool.id} has no output {src.output!r}"
         what = f"{src.step}.{src.output}"
-    if (upstream.type, upstream.data) != (port.type, port.data):
-        return (f"{what} is {upstream.type}{f' of {upstream.data}' if upstream.data else ''}, "
+        data = chosen_format(steps[src.step], upstream)  # the format that step writes
+    if (upstream.type, data) != (port.type, port.data):
+        return (f"{what} is {upstream.type}{f' of {data}' if data else ''}, "
                 f"the port wants {port.type}{f' of {port.data}' if port.data else ''}")
     return None

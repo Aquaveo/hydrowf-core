@@ -9,6 +9,7 @@ metadata:
     hydrowf/version: 0.1.0
   annotations:
     hydrowf/outputs: '{"run": "run/ngen-run", "cng": "to-cng/cng"}'
+    hydrowf/formats: '{"run": "ngen-run@1.0.0", "cng": "ngen-cng@1.0.0"}'
 spec:
   entrypoint: main
   artifactGC: {strategy: OnWorkflowDeletion}     # deleting the run deletes its outputs
