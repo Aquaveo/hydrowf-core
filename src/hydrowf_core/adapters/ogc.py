@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from hydrowf_core.models.lego import DataLego, Lego, Pipeline, PipelineInput, Port, ToolLego, anchored
+from hydrowf_core.models.lego import DataLego, Lego, Pipeline, PipelineInput, Port, ToolLego, anchored, chosen_format
 
 S3_URI = r"^s3://[^/]+/.+"
 JSON_TYPES = {"string": "string", "int": "integer", "float": "number", "boolean": "boolean"}
@@ -39,11 +39,13 @@ def port_schema(port: Port) -> dict:
     return schema
 
 
-def describe(port: Port, data_titles: dict[str, str]) -> str:
-    """The port's description, followed by the title of the data lego it carries."""
+def describe(port: Port, data_titles: dict[str, str], data: str | None = None) -> str:
+    """The port's description, followed by the title of the data lego it carries (`data`: the format a
+    step chose for an output that has several)."""
     parts = [port.description] if port.description else []
-    if port.data in data_titles:
-        parts.append(f"({data_titles[port.data]})")
+    data = data or port.data
+    if data in data_titles:
+        parts.append(f"({data_titles[data]})")
     return " ".join(parts)
 
 
@@ -100,7 +102,8 @@ def process_description(pipeline: Pipeline, legos: Iterable[Lego]) -> dict:
         if tool is None:
             raise UnsupportedForOgc(f"output {name}: step {link.step} has no registered tool")
         port = next(o for o in tool.outputs if o.name == link.output)
-        outputs[name] = {"title": name, "description": describe(port, data_titles), "schema": port_schema(port)}
+        outputs[name] = {"title": name, "schema": port_schema(port),
+                         "description": describe(port, data_titles, chosen_format(steps[link.step], port))}
 
     return {
         "id": pipeline.id,
