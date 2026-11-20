@@ -132,6 +132,8 @@ spec:
       artifacts:
       - name: cng
         path: /work/ngen-run_cng
+        archive: {none: {}}             # ngen-cng: files, not a .tgz (ngen-run above is archive: tgz)
+        s3: {key: "{{workflow.name}}/{{pod.name}}/cng/"}     # ends in "/": artifact GC deletes the files
     volumes:
     - name: work
       emptyDir: {}

@@ -88,7 +88,7 @@
   version: 1.0.0
   title: NGIAB run folder
   data_kind: output
-  storage: {driver: stac, format: other}
+  storage: {driver: stac, format: other, archive: tgz}    # a working folder: packed, not browsed
 
 # From hydrowf-tools nextgen/ngiab-preprocess/ngiab-preprocess.cwl (the spec it was copied from).
 - kind: tool

@@ -148,6 +148,12 @@ class StacStorage(Strict):
     driver: Literal["stac"]
     format: Literal["cog", "zarr", "geoparquet", "parquet", "netcdf", "other"]
     extensions: list[str] = []            # STAC extensions, e.g. raster, projection, datacube
+    # How a job's outputs of this data are stored: as files ("none": each file its own object, so STAC,
+    # maps and readers reach them), or packed into one .tgz ("tgz": working data nobody browses). Files
+    # keep no empty directories, file modes or symlinks: a working folder that needs them is "tgz". With
+    # "none", a tool must write what its port says (a file for `file`, a directory for `directory`): a
+    # directory written to a `file` port is stored under a key artifact GC won't clear.
+    archive: Literal["none", "tgz"] = "none"
     item_from: str | None = "manifest.json"   # per-file metadata the producing tool writes
     properties: dict[str, str] = {}       # STAC property -> manifest / run field
 
