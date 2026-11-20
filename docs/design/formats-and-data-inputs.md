@@ -1,12 +1,13 @@
-# Step 3: tool-declared formats and data legos as inputs
+# Step 3: tool-declared formats, data legos as inputs, reading in place
 
-Status: agreed (2026-11-20); PR 1 (formats) merged (#16); PR 2 (data drivers) in progress. Part of the data MVP:
+Status: Parts A-C agreed and built (core #16, #17, #18; ogc #25; tools round trip in review). Part D (reading
+in place) is a draft for review (2026-11-20). Part of the data MVP:
 
 | Step | What | State |
 |---|---|---|
 | 1 | Outputs stored as files | merged (core #15, ogc #23) |
-| 2 | STAC Items from each output's manifest | in review (ogc `stac-items`, tools `cng-manifest-0.2`) |
-| **3** | **Tool-declared output formats; data legos as inputs; NGIAB round trip** | **this document** |
+| 2 | STAC Items from each output's manifest | merged (ogc #24, tools #10) |
+| **3** | **Tool-declared output formats; data legos as inputs; NGIAB round trip; reading in place** | **this document** |
 | 4 | TEEHR evaluation (`teehr-timeseries`, `teehr-evaluate`) | after 3, builds on its formats |
 
 ## 1. Goals
@@ -21,6 +22,9 @@ Status: agreed (2026-11-20); PR 1 (formats) merged (#16); PR 2 (data drivers) in
    `external` and `stac` data.
 3. **An NGIAB run survives the trip to cloud-native files and back.** `ngiab-to-cng` carries what a rerun
    needs; a new `cng-to-ngen` tool rebuilds the run folder; a test proves the rerun gives the same output.
+4. **Cloud-native data is read in place.** Clients and tools fetch the bytes they need with range
+   requests, using short-lived read-only keys scoped to the prefixes they may read (Part D), instead of
+   downloading whole files.
 
 Non-goals: per-user uploads (later, as STAC files); the Iceberg driver's reads and writes; private
 pipelines and data in /ogc; a multi-choice port type (step 4 uses a string with a pattern); a STAC catalog.
@@ -152,16 +156,24 @@ under `shared_inputs` aren't typed and stay unchecked.
 
 ## 4. Part C: the NGIAB round trip
 
-- **ngiab-to-cng 0.3.0** copies what a rerun needs into the CNG output, unchanged: `config/realization.json`,
-  `config/troute.yaml`, `config/cat_config/` and the run folder's `partitions_*.json`, under `run/`, listed in the
-  manifest with their sha256 (the manifest already records input hashes). The gpkg is not copied: its
-  layers are the GeoParquet files.
-- **cng-to-ngen 0.1.0** (new, hydrowf-tools): `ngen-cng` -> `ngen-run` (`archive: tgz`). It writes the
-  configs back, rebuilds the gpkg from the GeoParquet layers (icefabric schemas, same layer names) and
-  `forcings/forcings.nc` from `timeseries/forcings.parquet`.
-- **Proof** (a test in hydrowf-tools, run in the tools' containers): the test run folder ->
-  ngiab-to-cng -> cng-to-ngen -> ngiab-run again; t-route's `flow` matches the first run's within float32
-  rounding, and the configs are byte-identical. Run once on kind as a pipeline too.
+Decided 2026-11-20 after looking at the data: **the run inputs are carried as they are, not rebuilt**.
+The GeoParquet conversion of the gpkg isn't lossless (hydrolocations loses its geometry, divide-attributes
+gains a null `glacier_percent`, GeoPackage specifics aren't kept), so a gpkg rebuilt from it would give
+ngen a different hydrofabric.
+
+- **ngiab-to-cng 0.3.0** copies what a rerun needs into `run/` in its output, byte for byte: every file
+  under `config/` (realization, `troute.yaml`, the gpkg, `cat_config/`), `forcings/forcings.nc` and
+  `partitions_*.json`. Manifest 0.3 lists them under `rerun: {dir, files: [{path, sha256, bytes}]}`.
+  Symlinks and special files in the run folder are refused before anything is converted. A run that
+  converts but can't be rebuilt (a file name outside `A-Z a-z 0-9 . _ -`, no realization, no forcings.nc)
+  keeps no `rerun`, and `not_converted` says why.
+- **cng-to-ngen 0.1.0** (new): copies `run/` back into a run folder, checking each path (plain, relative,
+  listed once, never a folder of another, never under `outputs/`) and hash (while copying), and creates
+  `outputs/ngen` and `outputs/troute`. A refusal leaves no partial folder.
+- **Proof** (`nextgen/cng-to-ngen/tests/round-trip.sh`, in containers): ngiab-run on the original folder
+  and on the rebuilt one, with the same pinned ngen image, give **identical** t-route flow; every refusal
+  gives its reason; 30,000 rerun paths are checked in under a second.
+- The forcings and the gpkg are therefore stored twice (native and cloud-native), for the retention period.
 - `ngen-cng` gets a new version (2.0.0) whose description says it is rerunnable.
 
 `teehr-timeseries` as a second format of ngiab-to-cng is step 4; this step only needs the formats
@@ -197,19 +209,96 @@ mechanism to exist (it is tested with fixture legos).
   file inputs do today, and no job writes under `managed/` (job keys start with the workflow name, and
   render refuses the name `managed`).
 
-## 7. Work breakdown
+## 7. Part D: reading in place
+
+### D.1 Why
+
+Cloud-native formats exist so readers fetch only the bytes they need (a COG's header and a few tiles, a
+Parquet row group, a few Zarr chunks) with HTTP range requests, instead of downloading whole files. Today:
+
+| Reader | How | In place? |
+|---|---|---|
+| A client reading a job's COG or Parquet | the STAC Item's presigned `href` (range requests work on it) | yes |
+| A client reading a job's Zarr | only an `s3://` address: a store is many objects, no one URL to sign | **no** (no credentials) |
+| A tool reading external data | `dataset` port, the public URL (Part B) | yes |
+| A tool reading managed data or a job's CNG output | Argo stages (copies) it onto the pod's disk (Part B) | **no** |
+| ngen reading its run folder | local files | no, and it must be: ngen reads local paths |
+
+Both gaps have one cause: reading in place needs read access to the platform bucket, which clients and
+tool pods don't have, and a presigned URL only covers one object.
+
+### D.2 Credential vending
+
+The platform, which holds the bucket's keys, hands out **short-lived read-only keys scoped to prefixes**:
+S3 STS `AssumeRole` with an inline **session policy** that allows `s3:GetObject` on the prefixes and
+`s3:ListBucket` with an `s3:prefix` condition on them, for 15 to 60 minutes. Readers use them as usual
+(fsspec/s3fs, Zarr, DuckDB, GDAL, pyarrow).
+
+**Verified on kind** (RustFS 1.0.5, 2026-11-20), keys scoped to one job's `cng/` prefix:
+
+| Request | Answer |
+|---|---|
+| `AssumeRole` with a session policy | OK: access key, secret, session token, expiry |
+| list the prefix; range read inside it (`bytes=0-15`) | OK; `Content-Range: bytes 0-15/1772` |
+| list or read another prefix; list the bucket | AccessDenied (403) |
+| write inside the prefix | AccessDenied (403) |
+
+The probe's parent was the admin key. In a deployment the parent is a **dedicated read-only user** (its
+own policy: `GetObject`/`ListBucket` on the bucket, nothing else), so a session can only ever narrow it.
+
+### D.3 For clients (first)
+
+- `GET /ogc/jobs/{id}/credentials`: the job's owner only (a 404 for anyone else, as results), for a
+  succeeded job. The prefixes are the job's output keys as Argo recorded them (`runtime.outputs`), never
+  caller input. Answers `{access_key_id, secret_access_key, session_token, expiration, endpoint, bucket,
+  prefixes}` with `Cache-Control: no-store`.
+- STAC Items gain the storage extension's fields (or a link to the credentials route) so a client knows
+  how to open a Zarr asset: `xr.open_zarr("s3://…/forcings.zarr", storage_options={…})`.
+- Shared managed data can be added to the prefixes later (a public read-only prefix needs no vending).
+
+### D.4 For tools (second)
+
+A tool could then read managed data or a job's CNG output from a `dataset` port, in place, instead of
+having it staged (TEEHR reading `timeseries/*.parquet`). The hard part is **getting keys into the pod**:
+
+- **Never in the workflow spec.** Argo keeps specs in the cluster and in its archive, and anyone who can
+  read workflows could read the keys. Keys minted at submit would also expire while a run waits in a
+  queue.
+- **Proposed:** an init step in the pod asks an in-cluster vending endpoint for keys, proving who it is
+  with a projected service-account token (audience: the vendor). The vendor reads the workflow's own
+  record of the step's dataset inputs (an annotation render writes, like `hydrowf/formats`) and scopes the
+  keys to exactly those prefixes. A refresh before expiry covers long steps.
+- `check()` then allows managed and job-output data on dataset ports (Part B refuses them today).
+
+### D.5 Security notes
+
+- Keys are read-only, prefix-scoped and short-lived; the session policy can only narrow the parent's.
+- Prefixes come from what the platform recorded (Argo's output keys, the workflow's annotations,
+  managed data legos' `location`), never from the caller.
+- Keys never go into workflow specs, annotations, logs or URLs; the response is `no-store`.
+- `ListBucket` is limited by an `s3:prefix` condition, so a session can't list other jobs' keys.
+
+### D.6 Open questions
+
+1. Session length: 15 minutes (the STS minimum) or 60? A reader holding a Zarr open for longer refreshes.
+2. Is the new cluster's S3 RustFS too? If not, its STS must be checked the same way.
+3. D.3 alone, before step 4, or D.3 and D.4 together so TEEHR reads in place from the start?
+
+## 8. Work breakdown
 
 | PR | Repo | Contents | Depends on |
 |---|---|---|---|
 | 1 | hydrowf-core | `Port.formats`, `Step.formats`, `{<output>_format}`, checks, render, `hydrowf/formats`, `output_formats` | |
 | 2 | hydrowf-core | external and managed-STAC drivers (`DataSource`, external on dataset ports, managed staged, `StacStorage.location`); caller dataset inputs stay refused | 1 |
 | 3 | hydrowf-ogc | pin core; results read `hydrowf/formats`; inputs checked against their data (3.3); registry legos updated | 1, 2 |
-| 4 | hydrowf-tools | ngiab-to-cng 0.3.0 (configs), cng-to-ngen 0.1.0, round-trip test | |
+| 4 | hydrowf-tools | ngiab-to-cng 0.3.0 (run inputs as is), cng-to-ngen 0.1.0, round-trip test | |
 | 5 | hydrowf-ogc | pin the two new images; `ngen-cng@2.0.0`; a pipeline that reruns from CNG | 3, 4 |
+| 6 | hydrowf-deploy, hydrowf-ogc | D.3: a read-only S3 user; `/ogc/jobs/{id}/credentials`; Items say how to open Zarr | |
+| 7 | hydrowf-core, hydrowf-ogc | D.4: the vending endpoint, init step, dataset ports for managed and job-output data | 6 |
 
 Each PR: tests first, gates, an independent review (the core PRs change a public API).
 
-## 8. Decisions (2026-11-20)
+## 9. Decisions (2026-11-20)
 
 1. **Dataset URLs come from registered data legos only.** A caller can't pass their own URL in step 3;
    users bring their own data with uploads (later), into our bucket under checks we control.
@@ -217,3 +306,7 @@ Each PR: tests first, gates, an independent review (the core PRs change a public
    published and wiring is checked before any run. A per-run choice can be added later (a `Step.formats`
    value taken from a pipeline input) without breaking this.
 3. **Managed data is put at its `location` by an admin script** in hydrowf-deploy until uploads exist.
+4. **A rerun reads the original run inputs**, carried as they are (Part C), not rebuilt from the
+   cloud-native files.
+5. **Read in place where the reader can** (Part D): clients and tools get scoped, short-lived read keys;
+   ngen keeps staged local files.
