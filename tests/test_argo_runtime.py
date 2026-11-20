@@ -227,3 +227,35 @@ def test_a_run_without_a_creation_time_sorts_last():
     untimed["metadata"]["name"] = "ngiab-simulation-untimed"
     del untimed["metadata"]["creationTimestamp"]
     assert [r.name for r in runtime(listed=[untimed, SUCCEEDED]).list()] == [NAME, "ngiab-simulation-untimed"]
+
+
+def test_status_carries_the_format_each_output_was_written_as():
+    wf = copy.deepcopy(SUCCEEDED)
+    wf["metadata"]["annotations"]["hydrowf/formats"] = json.dumps({"run": "ngen-run@1.0.0", "cng": "ngen-cng@1.0.0"})
+    assert runtime(wf).status(NAME).formats == {"run": "ngen-run@1.0.0", "cng": "ngen-cng@1.0.0"}
+
+
+@pytest.mark.parametrize("annotation", [None, "not json", "[]", '{"run": 1}', '{"run": "no-version"}'],
+                         ids=["missing", "not-json", "not-an-object", "not-text", "no-version"])
+def test_a_run_without_a_readable_formats_annotation_has_none(annotation):
+    wf = copy.deepcopy(SUCCEEDED)
+    wf["metadata"]["annotations"].pop("hydrowf/formats", None)
+    if annotation is not None:
+        wf["metadata"]["annotations"]["hydrowf/formats"] = annotation
+    assert runtime(wf).status(NAME).formats == {}
+
+
+@pytest.mark.parametrize("annotation", ["not json", "[]", '{"run": 1}', '{"run": "no-slash"}'],
+                         ids=["not-json", "not-an-object", "not-text", "no-artifact"])
+def test_a_run_with_an_unreadable_outputs_annotation_has_no_outputs(annotation):
+    wf = copy.deepcopy(SUCCEEDED)
+    wf["metadata"]["annotations"]["hydrowf/outputs"] = annotation
+    assert runtime(wf).outputs(NAME) == {}
+
+
+def test_listed_and_not_yet_started_runs_carry_their_formats_too():
+    wf = copy.deepcopy(SUCCEEDED)
+    wf["metadata"]["annotations"]["hydrowf/formats"] = json.dumps({"run": "ngen-run@1.0.0"})
+    assert runtime(listed=[wf]).list()[0].formats == {"run": "ngen-run@1.0.0"}
+    pending = {k: v for k, v in wf.items() if k != "status"}
+    assert runtime(pending).status(NAME).formats == {"run": "ngen-run@1.0.0"}

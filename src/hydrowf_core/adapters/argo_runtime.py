@@ -38,6 +38,9 @@ class RunStatus:
     finished_at: datetime | None = None
     progress: str = ""                    # "<done>/<total>" of the planned steps, e.g. "2/3"
     labels: dict[str, str] = field(default_factory=dict)   # the workflow's labels, render()'s and the caller's
+    # pipeline output -> the data lego it was written as, "id@version" (render()'s hydrowf/formats); {} for
+    # runs rendered before formats
+    formats: dict[str, str] = field(default_factory=dict)
 
     @property
     def finished(self) -> bool:
@@ -102,7 +105,7 @@ class ArgoRuntime:
         (artifact.name, artifact.s3.key).
         """
         wf = self._get(name)
-        wanted = json.loads((wf.metadata.annotations or {}).get("hydrowf/outputs", "{}"))
+        wanted = outputs_of(wf.metadata.annotations or {})
         pods = {n.display_name: n for n in ((wf.status and wf.status.nodes) or {}).values()
                 if n.type == "Pod" and n.phase == "Succeeded"}        # unfinished steps have no outputs yet
         found: dict[str, str] = {}
@@ -141,11 +144,38 @@ def progress(steps: dict[str, str], planned: list[str], argo_progress: str) -> s
     return f"{done}/{len(planned)}"
 
 
+def outputs_of(annotations: dict[str, str]) -> dict[str, str]:
+    """The hydrowf/outputs annotation as {output: "<task>/<artifact>"}; {} when it is missing or isn't that
+    shape, like formats_of."""
+    try:
+        found = json.loads(annotations.get("hydrowf/outputs", "{}"))
+    except ValueError:
+        return {}
+    if not isinstance(found, dict) or not all(isinstance(k, str) and isinstance(v, str) and "/" in v
+                                              for k, v in found.items()):
+        return {}
+    return found
+
+
+def formats_of(annotations: dict[str, str]) -> dict[str, str]:
+    """The hydrowf/formats annotation as {output: "id@version"}; {} when it is missing or isn't that shape
+    (render() writes it, but anyone who may edit workflows could change it)."""
+    try:
+        found = json.loads(annotations.get("hydrowf/formats", "{}"))
+    except ValueError:
+        return {}
+    if not isinstance(found, dict) or not all(isinstance(k, str) and isinstance(v, str) and "@" in v
+                                              for k, v in found.items()):
+        return {}
+    return found
+
+
 def run_status(wf: m.Workflow) -> RunStatus:
     """A RunStatus from one workflow (a get_workflow answer or a list_workflows item)."""
     meta, status = wf.metadata, wf.status
     labels = dict(meta.labels or {})
-    common = dict(pipeline=labels.get("hydrowf/pipeline", ""), labels=labels, created_at=time(meta.creation_timestamp))
+    common = dict(pipeline=labels.get("hydrowf/pipeline", ""), labels=labels, created_at=time(meta.creation_timestamp),
+                  formats=formats_of(meta.annotations or {}))
     if status is None:                                   # the controller hasn't picked it up yet
         return RunStatus(meta.name, "Pending", **common)
     steps = {n.display_name: n.phase or "Pending" for n in (status.nodes or {}).values() if n.type == "Pod"}
