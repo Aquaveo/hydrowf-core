@@ -9,7 +9,8 @@ The models validate each lego on its own. What needs other legos is here:
 - a step's format choices name outputs that list formats, and one of their formats
 - a data lego feeds a port its driver can serve: external data a dataset port of a tool that declares
   `network: true` (the tool reads the URL in place); managed STAC data a file or directory port (staged
-  from its `location`: a key ending in "/" is a directory); Iceberg data a dataset port (no runtime
+  from its `location`: a key ending in "/" is a directory) or a dataset port (read in place with keys the
+  runtime hands the step, render's `reader`); Iceberg data a dataset port (no runtime
   adapter reads it yet: render refuses it, check doesn't, since a pipeline's wiring doesn't depend on
   the runtime)
 
@@ -107,9 +108,10 @@ def data_source_problem(port: Port, src: DataSource, by_key: dict[tuple[str, str
 
 def managed_problem(data_id: str, location: str, port_type: str) -> str | None:
     """Why managed data at `location` can't feed a `port_type` port: Argo stages it, with its own
-    credentials, as the file or directory the location names; tools have no credentials for the bucket."""
+    credentials, as the file or directory the location names; a dataset port reads it in place, with
+    read keys the runtime hands the step (render's `reader`)."""
     if port_type == "dataset":
-        return f"managed data {data_id} is staged: it feeds a file or directory port, not a dataset port"
+        return None
     kind = "directory" if location.endswith("/") else "file"
     if kind != port_type:
         return f"managed data {data_id} is a {kind} ({location}), the port wants a {port_type}"

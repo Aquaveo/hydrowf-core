@@ -5,7 +5,7 @@ import re
 import pytest
 from pydantic import ValidationError
 
-from hydrowf_core.adapters.argo import UnsupportedForArgo, render
+from hydrowf_core.adapters.argo import BadInputs, UnsupportedForArgo, render
 from hydrowf_core.models import LEGOS, Pipeline, Port
 from hydrowf_core.registry import check
 
@@ -123,12 +123,10 @@ def test_a_data_lego_feeds_the_ports_its_driver_serves(port_type, data_id, netwo
     ("file", "hf-tables", None, False, "iceberg data hf-tables is read in place: it feeds a dataset port, "
                                        "not a file port"),
     ("file", "conus-gpkg", "result", False, "data lego result doesn't fit a port of conus-gpkg"),
-    ("dataset", "conus-gpkg", None, False, "managed data conus-gpkg is staged: it feeds a file or directory "
-                                           "port, not a dataset port"),
     ("directory", "conus-gpkg", None, False,
      "managed data conus-gpkg is a file (managed/conus-gpkg/2.2.0/conus_nextgen.gpkg), the port wants a directory"),
 ], ids=["external-without-network", "external-to-file", "output-by-id", "iceberg-to-file", "other-data",
-        "managed-to-dataset", "managed-file-to-directory"])
+        "managed-file-to-directory"])
 def test_a_data_lego_on_a_port_its_driver_cant_serve_is_a_problem(port_type, data_id, source, network, message):
     assert check(registry(port_type, data_id, source, network)) == [f"pipeline p@0.1.0: step read.src: {message}"]
 
@@ -159,8 +157,7 @@ def test_managed_data_is_staged_from_its_location(port_type, location):
     ("dataset", "nwm-retro", None, False, "reader must declare network: true"),
     ("file", "nwm-retro", None, True, "external data nwm-retro is read in place: it feeds a dataset port"),
     ("file", "result", None, False, "result is output data"),
-    ("dataset", "conus-gpkg", None, False, "managed data conus-gpkg is staged"),
-], ids=["external-without-network", "external-to-file", "output-by-id", "managed-to-dataset"])
+], ids=["external-without-network", "external-to-file", "output-by-id"])
 def test_render_refuses_what_check_refuses(port_type, data_id, source, network, message):
     legos = registry(port_type, data_id, source, network)       # render doesn't rely on check having run
     with pytest.raises(UnsupportedForArgo, match=r"^step read\.src: .*" + re.escape(message)):
@@ -179,10 +176,10 @@ def test_iceberg_data_has_no_argo_driver_yet():
         render(pipeline_of(legos), legos, {})
 
 
-def test_a_caller_never_gives_a_dataset_url():
+def test_a_callers_dataset_input_is_an_s3_key_not_a_url_of_their_choosing():
     legos = registry("dataset", "nwm-retro", network=True)
     pipeline = pipeline_of(legos).model_copy(update={"inputs": [Port(name="ds", type="dataset", data="nwm-retro")]})
-    with pytest.raises(UnsupportedForArgo, match="a dataset comes from a registered data lego"):
+    with pytest.raises(BadInputs, match="is an s3://<bucket>/<key> URL"):
         render(pipeline, legos, {"ds": "https://my-lab.org/data.zarr"})
 
 

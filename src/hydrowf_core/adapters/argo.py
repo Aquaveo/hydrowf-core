@@ -7,8 +7,12 @@ its argument list filled in (ToolLego.argv). File and directory ports become Arg
 - a link between steps is `from: {{tasks.<step>.outputs.artifacts.<output>}}`
 - a registered data lego as a step input (DataSource): external data gives a dataset port of a
   network tool its URL (the tool reads it in place); managed STAC data is staged from its `location` key
-  for a file or directory port. Iceberg data has no driver here yet. A caller's own dataset URLs are
-  never taken: datasets come from registered data legos
+  for a file or directory port. Iceberg data has no driver here yet.
+- a dataset port reads our bucket in place: a managed data lego's location, or a pipeline dataset input
+  (an s3:// key in the bucket, like a file input). The tool gets s3://<bucket>/<key>, and the step gets
+  read keys for exactly those keys (`Reader`): an init container presents the pod's projected
+  service-account token to the vendor and writes an AWS credentials file the tool's SDK reads. The
+  workflow's hydrowf/reads annotation records each step's keys, which is what the vendor scopes to.
 - no workflow is named `managed`: its outputs would land under managed/, where managed data lives
 - a tool's `files` are raw artifacts
 - an output is stored as files (archive: none), unless its data lego's storage says archive: tgz, in
@@ -34,10 +38,11 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 
-from hydrowf_core.models.lego import (MANAGED_PREFIX, DataLego, DataSource, ExternalStorage, Lego, Link, Pipeline,
-                                      PipelineInput, Port, Scalar, StacStorage, Step, ToolLego, Value, chosen_format,
-                                      fill, format_name, value_problem)
+from hydrowf_core.models.lego import (MANAGED_PREFIX, PLAIN_KEY, DataLego, DataSource, ExternalStorage, Lego, Link,
+                                      Pipeline, PipelineInput, Port, Scalar, StacStorage, Step, ToolLego, Value,
+                                      chosen_format, fill, format_name, value_problem)
 from hydrowf_core.registry.validate import data_source_problem
 
 FILE_TYPES = ("file", "directory")
@@ -62,6 +67,88 @@ LABEL_KEY = re.compile(rf"(?:(?=[^/]{{1,253}}/){DNS_LABEL}(?:\.{DNS_LABEL})*/)?{
 RESERVED_LABELS = ("hydrowf/pipeline", "hydrowf/version")       # render() sets these itself
 
 
+READS_DIR = "/var/run/hydrowf"                 # in a step that reads in place: token/ and aws/ live here
+# an image pinned by digest, from a registry that may have a port; nothing Argo or Kubernetes would expand
+PINNED_IMAGE = re.compile(r"([A-Za-z0-9.\-]+(:[0-9]+)?/)?[a-z0-9._/\-]+@sha256:[0-9a-f]{64}")
+PLAIN_URL = re.compile(r"https?://[A-Za-z0-9.\-]+(:[0-9]+)?(/[A-Za-z0-9._~/\-]*)?")   # no {{ }}, $( ), spaces
+
+
+@dataclass(frozen=True)
+class Reader:
+    """How a step that reads our bucket in place gets read keys (hydrowf-core docs/design Part D.4).
+
+    An init container (`image`: anything with curl, pinned by digest) POSTs the pod's projected
+    service-account token (audience `audience`) to `vendor_url`, and writes the answer, an AWS credentials
+    file, where the tool's SDK finds it (AWS_SHARED_CREDENTIALS_FILE). The tool reaches S3 at `s3_endpoint`
+    (AWS_ENDPOINT_URL; on AWS the regional endpoint) in `region`. `bucket` is the artifact repository's.
+    """
+    image: str
+    vendor_url: str
+    bucket: str
+    s3_endpoint: str
+    region: str = "us-east-1"
+    audience: str = "hydrowf-vendor"
+    token_seconds: int = 600
+
+    def __post_init__(self):
+        if not PINNED_IMAGE.fullmatch(self.image):
+            raise ValueError(f"reader: image {self.image!r} must be pinned by digest (name@sha256:...)")
+        for name in ("vendor_url", "s3_endpoint"):
+            if not PLAIN_URL.fullmatch(getattr(self, name)):
+                raise ValueError(f"reader: {name} {getattr(self, name)!r} is not a plain http(s) URL")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]", self.bucket):
+            raise ValueError(f"reader: bucket {self.bucket!r} is not an S3 bucket name")
+        if not re.fullmatch(r"[a-z0-9-]+", self.region) or not re.fullmatch(r"[A-Za-z0-9.\-]+", self.audience):
+            raise ValueError("reader: region and audience are plain names")
+        if not 600 <= self.token_seconds <= 86400:            # Kubernetes refuses projected tokens under 10 min
+            raise ValueError("reader: token_seconds is 600 to 86400")
+
+
+def reader_parts(reader: Reader) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """(volumes, init containers, the tool's env, the tool's volume mounts) for a step that reads in place.
+    The token goes in the request body (curl --data-binary @file): no shell, nothing Kubernetes expands."""
+    volumes = [
+        {"name": "hydrowf-token", "projected": {"sources": [{"serviceAccountToken": {
+            "audience": reader.audience, "expirationSeconds": reader.token_seconds, "path": "token"}}]}},
+        {"name": "hydrowf-aws", "emptyDir": {"medium": "Memory"}},       # the keys never touch a disk
+    ]
+    init = [{
+        "name": "hydrowf-keys",
+        "image": reader.image,
+        "command": ["curl", "--fail", "--silent", "--show-error", "--retry", "3", "--retry-connrefused",
+                    "--max-time", "30", "--data-binary", f"@{READS_DIR}/token/token",
+                    "--output", f"{READS_DIR}/aws/credentials", reader.vendor_url],
+        "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "64Mi"}},
+        "volumeMounts": [{"name": "hydrowf-token", "mountPath": f"{READS_DIR}/token", "readOnly": True},
+                         {"name": "hydrowf-aws", "mountPath": f"{READS_DIR}/aws"}],
+    }]
+    credentials = f"{READS_DIR}/aws/credentials"
+    host = reader.s3_endpoint.split("://", 1)[1].split("/", 1)[0]
+    env = [
+        # botocore, s3fs, xarray, DuckDB: the vended file, our endpoint, and nothing that would win over them
+        # (keys in the env come before the file, AWS_PROFILE could name another profile, AWS_CONFIG_FILE add a
+        # credential_process, AWS_ENDPOINT_URL_S3 come before AWS_ENDPOINT_URL). Empty means unset, and
+        # these override the image's own ENV too.
+        {"name": "AWS_SHARED_CREDENTIALS_FILE", "value": credentials},
+        {"name": "AWS_PROFILE", "value": "default"},
+        {"name": "AWS_CONFIG_FILE", "value": f"{READS_DIR}/aws/config"},          # absent: no extra config
+        {"name": "AWS_ACCESS_KEY_ID", "value": ""},
+        {"name": "AWS_SECRET_ACCESS_KEY", "value": ""},
+        {"name": "AWS_SESSION_TOKEN", "value": ""},
+        {"name": "AWS_ENDPOINT_URL", "value": reader.s3_endpoint},
+        {"name": "AWS_ENDPOINT_URL_S3", "value": reader.s3_endpoint},
+        {"name": "AWS_REGION", "value": reader.region},
+        {"name": "AWS_DEFAULT_REGION", "value": reader.region},
+        # GDAL and rasterio (COGs): the same file, the endpoint without its scheme, path-style addressing
+        {"name": "CPL_AWS_CREDENTIALS_FILE", "value": credentials},
+        {"name": "AWS_S3_ENDPOINT", "value": host},
+        {"name": "AWS_HTTPS", "value": "YES" if reader.s3_endpoint.startswith("https") else "NO"},
+        {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+    ]
+    mounts = [{"name": "hydrowf-aws", "mountPath": f"{READS_DIR}/aws", "readOnly": True}]
+    return volumes, init, env, mounts
+
+
 def check_labels(labels: Mapping[str, str]) -> dict[str, str]:
     """`labels` if every key and value is a valid Kubernetes label; ValueError otherwise. Callers build
     label selectors from them, so a value like "a,b" or "x!=y" must never get through."""
@@ -82,7 +169,7 @@ def k8s_name(name: str) -> str:
 
 def s3_key(url: object) -> str:
     if not isinstance(url, str) or not url.startswith("s3://") or url.count("/") < 3:
-        raise BadInputs(f"{url!r}: a file or directory input is an s3://<bucket>/<key> URL")
+        raise BadInputs(f"{url!r}: a file, directory or dataset input is an s3://<bucket>/<key> URL")
     return url.split("/", 3)[3]
 
 
@@ -103,11 +190,8 @@ def pipeline_values(pipeline: Pipeline, inputs: Mapping[str, Scalar]) -> dict[st
         if value is None:
             if not port.optional:
                 raise BadInputs(f"input {port.name} is required")
-        elif port.type in FILE_TYPES:
+        elif port.type in FILE_TYPES or port.type == "dataset":       # a dataset: a key read in place
             s3_key(value)
-        elif port.type == "dataset":
-            raise UnsupportedForArgo(f"input {port.name}: a dataset comes from a registered data lego "
-                                     "({data: {id, version}} in the pipeline), not from the caller")
         elif problem := value_problem(port.type, port.symbols, value, port.pattern):
             raise BadInputs(f"input {port.name}: {problem}")
         values[port.name] = value
@@ -115,10 +199,11 @@ def pipeline_values(pipeline: Pipeline, inputs: Mapping[str, Scalar]) -> dict[st
 
 
 def data_source(step: Step, tool: ToolLego, port: Port, src: DataSource,
-                data: Mapping[tuple[str, str], DataLego]) -> tuple[str | None, dict | None]:
-    """What a registered data lego gives `port`: (a value, None) or (None, an artifact source). The same
-    rules as registry.check, checked again here: an external URL is the one thing anyone may publish that
-    reaches a container's command line."""
+                data: Mapping[tuple[str, str], DataLego], reader: Reader | None = None
+                ) -> tuple[str | None, dict | None, str | None]:
+    """What a registered data lego gives `port`: (a value, None, the key read in place or None) or (None,
+    an artifact source, None). The same rules as registry.check, checked again here: an external URL is the
+    one thing anyone may publish that reaches a container's command line."""
     where = f"step {step.name}.{port.name}"
     lego = data.get(src.data.key())
     if lego is None:
@@ -128,37 +213,72 @@ def data_source(step: Step, tool: ToolLego, port: Port, src: DataSource,
         raise UnsupportedForArgo(f"{where}: {problem}")
     storage = lego.storage
     if isinstance(storage, ExternalStorage):
-        return storage.url, None                                 # read in place by the tool
+        return storage.url, None, None                           # public: read in place, no keys
+    if isinstance(storage, StacStorage) and port.type == "dataset":
+        return in_place(where, storage.location, reader), None, storage.location
     if isinstance(storage, StacStorage):
-        return None, {"s3": {"key": storage.location}}           # staged like an s3:// pipeline input
+        return None, {"s3": {"key": storage.location}}, None     # staged like an s3:// pipeline input
     raise UnsupportedForArgo(f"{where}: {lego.id} is {storage.driver} data: Argo has no driver for it yet")
 
 
+def in_place(where: str, key: str, reader: Reader | None) -> str:
+    """The s3:// URL a dataset port gets for `key` in our bucket, read in place with the step's keys."""
+    if reader is None:
+        raise UnsupportedForArgo(f"{where}: reading the bucket in place needs read keys for the step "
+                                 "(render's reader: the vendor and its init image)")
+    return f"s3://{reader.bucket}/{key}"
+
+
+def caller_read(where: str, url: object, reader: Reader | None) -> str:
+    """The key a caller's dataset input reads in place: in our bucket, a plain key with no empty, `.` or `..`
+    part. It becomes what the step's read keys cover (hydrowf/reads), so nothing else gets through: not the
+    whole bucket, not another bucket's key moved onto ours."""
+    if reader is None:
+        in_place(where, "", None)                  # the same refusal
+    if not isinstance(url, str) or not url.startswith(f"s3://{reader.bucket}/"):
+        raise BadInputs(f"{where}: a dataset input is an s3://{reader.bucket}/<key> URL")
+    key = url[len(f"s3://{reader.bucket}/"):]
+    if not PLAIN_KEY.fullmatch(key) or any(part in ("", ".", "..") for part in key.removesuffix("/").split("/")):
+        raise BadInputs(f"{where}: {key!r} is not a plain key (A-Z a-z 0-9 . _ / -, no empty, . or .. part)")
+    return key
+
+
 def task_inputs(step: Step, tool: ToolLego, values: dict[str, Scalar | None],
-                data: Mapping[tuple[str, str], DataLego] | None = None
-                ) -> tuple[dict[str, Scalar | None], dict[str, dict]]:
+                data: Mapping[tuple[str, str], DataLego] | None = None, reader: Reader | None = None,
+                input_types: Mapping[str, str] | None = None
+                ) -> tuple[dict[str, Scalar | None], dict[str, dict], list[str]]:
     """Where each of the tool's inputs comes from, for one step.
 
-    Returns (scalars, artifacts):
+    Returns (scalars, artifacts, reads):
     - scalars: input name -> value, for every non-file input (unset optional ones as None)
     - artifacts: input name -> Argo artifact source, for file/directory inputs that have one:
       {"s3": {"key": ...}} from a pipeline input or a managed data lego, {"from": "{{tasks...}}"} from a link
+    - reads: the keys in our bucket the step reads in place (dataset ports), which its read keys cover
+
+    `input_types` is the pipeline's input name -> port type: a dataset port reads in place only from a
+    `dataset` pipeline input (whose value the caller's service checked as one), never from any other.
     """
     scalars: dict[str, Scalar | None] = {}
     artifacts: dict[str, dict] = {}
+    reads: list[str] = []
+    where = f"step {step.name}"
     for port in tool.inputs:                      # the ports, so unconnected ones get their default
         src = step.inputs.get(port.name)
         if isinstance(src, DataSource):
-            value, artifact = data_source(step, tool, port, src, data or {})
+            value, artifact, read = data_source(step, tool, port, src, data or {}, reader)
             if artifact is not None:
                 artifacts[port.name] = artifact
             else:
                 scalars[port.name] = value
+            reads += [read] if read else []
             continue
         if isinstance(src, Link):
             artifacts[port.name] = {"from": f"{{{{tasks.{src.step}.outputs.artifacts.{k8s_name(src.output)}}}}}"}
             continue
         if isinstance(src, Value):
+            if port.type == "dataset":
+                raise UnsupportedForArgo(f"{where}.{port.name}: a dataset port takes a data lego or a "
+                                         "dataset input, not a constant")
             value = src.value
         elif isinstance(src, PipelineInput):
             value = values[src.input]
@@ -167,11 +287,21 @@ def task_inputs(step: Step, tool: ToolLego, values: dict[str, Scalar | None],
                 raise BadInputs(f"input {src.input} (step {step.name}.{port.name}): {problem}")
         else:
             value = port.default
-        if port.type not in FILE_TYPES:
+        if port.type == "dataset" and isinstance(src, PipelineInput):
+            if (input_types or {}).get(src.input) != "dataset":
+                raise UnsupportedForArgo(f"{where}.{port.name}: a dataset port reads only from a dataset "
+                                         f"input, not from {src.input!r}")
+            if value is not None:                 # the caller's own job output (hydrowf-ogc checks whose)
+                key = caller_read(f"{where}.{port.name}", value, reader)
+                scalars[port.name] = in_place(f"{where}.{port.name}", key, reader)
+                reads.append(key)
+            else:
+                scalars[port.name] = None
+        elif port.type not in FILE_TYPES:
             scalars[port.name] = value            # None too: argv needs every name
         elif value is not None:                   # an unset optional file is simply not staged
             artifacts[port.name] = {"s3": {"key": s3_key(value)}}
-    return scalars, artifacts
+    return scalars, artifacts, reads
 
 
 def resources(tool: ToolLego) -> dict:
@@ -249,7 +379,8 @@ def output_artifact(port: Port, path: str, archives: Mapping[str, str], data: st
 
 
 def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | None], staged: Iterable[str],
-                       entrypoint: Entrypoint | None, archives: Mapping[str, str] | None = None) -> dict:
+                       entrypoint: Entrypoint | None, archives: Mapping[str, str] | None = None,
+                       reader: Reader | None = None, reads: Iterable[str] = ()) -> dict:
     """One step's Argo template: stage inputs and files under the workdir, run, collect outputs."""
     formats = {p.name: chosen_format(step, p) for p in tool.outputs}
     runtime = {**scalars, "workdir": tool.workdir, "cpu": tool.cpu, "run": RUN_NAME,
@@ -273,24 +404,38 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
         container["command"] = list(command)
     container["args"] = tool.argv(values)
     container["workingDir"] = tool.workdir
-    if tool.env:
-        container["env"] = [{"name": k, "value": fill(v, values)} for k, v in tool.env.items()]
+    env = [{"name": k, "value": fill(v, values)} for k, v in tool.env.items()]
     container["resources"] = resources(tool)
     container["volumeMounts"] = [{"name": "work", "mountPath": tool.workdir}]
+    volumes: list[dict] = [{"name": "work", "emptyDir": {}}]
+    template: dict = {"name": f"step-{step.name}"}
+    if list(reads):
+        if reader is None:
+            raise UnsupportedForArgo(f"step {step.name}: reading the bucket in place needs render's reader")
+        more_volumes, init, aws_env, mounts = reader_parts(reader)
+        names = {e["name"] for e in aws_env}
+        # in a step that reads with vended keys the tool sets no AWS_* (nor the other names above)
+        env = [e for e in env if not e["name"].startswith("AWS_") and e["name"] not in names] + aws_env
+        volumes += more_volumes
+        container["volumeMounts"] += mounts
+        template["initContainers"] = init
+    if env:
+        container["env"] = env
 
     return {
-        "name": f"step-{step.name}",
+        **template,
         "inputs": {"artifacts": in_artifacts},
         "outputs": {"artifacts": [output_artifact(p, at(p.path), archives or {}, formats[p.name])
                                   for p in tool.outputs if p.type in FILE_TYPES]},
-        "volumes": [{"name": "work", "emptyDir": {}}],
+        "volumes": volumes,
         "container": container,
     }
 
 
 def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scalar],
            entrypoint: Entrypoint | None = None, name: str | None = None,
-           labels: Mapping[str, str] | None = None, keep_days: int | None = None) -> dict:
+           labels: Mapping[str, str] | None = None, keep_days: int | None = None,
+           reader: Reader | None = None) -> dict:
     """An Argo Workflow that runs `pipeline` once with `inputs`.
 
     `legos` must contain the steps' tools (registry.check has passed on them). `entrypoint(image)`
@@ -299,6 +444,8 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
     Argo copies the name into a pod label, so keep it a DNS name of 63 characters or less.
     `labels` are the caller's own workflow labels (e.g. who submitted the run); they can't replace
     hydrowf/pipeline or hydrowf/version.
+
+    `reader` lets dataset ports read our bucket in place (Reader); without it such a pipeline is refused.
 
     Deleting the workflow deletes its output artifacts and archived logs too (artifactGC). With
     `keep_days`, Argo deletes the workflow, and so its outputs, that many days after it finishes.
@@ -318,6 +465,8 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
     values = pipeline_values(pipeline, inputs)
     steps = {s.name: s for s in pipeline.steps}
     templates, tasks = [], []
+    reads: dict[str, list[str]] = {}                # step -> the keys it reads in place
+    input_types = {port.name: port.type for port in pipeline.inputs}
     for step_name in pipeline.order():
         step = steps[step_name]
         tool = tools.get(step.tool.key())
@@ -325,8 +474,16 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
             raise UnsupportedForArgo(f"step {step_name}: {step.tool.id}@{step.tool.version} is not a registered tool")
         if "argo" not in tool.runs_on:
             raise UnsupportedForArgo(f"step {step_name}: {tool.id} does not run on argo")
-        scalars, artifacts = task_inputs(step, tool, values, data)
-        templates.append(container_template(step, tool, scalars, artifacts, entrypoint, archives))
+        scalars, artifacts, step_reads = task_inputs(step, tool, values, data, reader, input_types)
+        ours = f"s3://{reader.bucket}/" if reader else ""
+        if step_reads and any(isinstance(v, str) and v.startswith("s3://") and not v.startswith(ours)
+                              for v in scalars.values()):
+            # the step's S3 endpoint and keys are ours: an external s3:// source would go to our endpoint
+            raise UnsupportedForArgo(f"step {step_name}: a step that reads our bucket in place can't also read "
+                                     "another s3:// bucket")
+        templates.append(container_template(step, tool, scalars, artifacts, entrypoint, archives, reader, step_reads))
+        if step_reads:
+            reads[step_name] = step_reads
         task: dict = {"name": step_name, "template": f"step-{step_name}"}
         deps = sorted({src.step for src in step.inputs.values() if isinstance(src, Link)})
         if deps:
@@ -346,6 +503,7 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
             "annotations": {
                 "hydrowf/outputs": json.dumps(outputs),       # pipeline output -> task/artifact
                 "hydrowf/formats": json.dumps(formats),       # pipeline output -> data lego id@version
+                **({"hydrowf/reads": json.dumps(reads)} if reads else {}),   # step -> keys it reads in place
             },
         },
         "spec": {
