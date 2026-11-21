@@ -4,7 +4,8 @@ Values are resolved when the workflow is written: each step becomes one containe
 its argument list filled in (ToolLego.argv). File and directory ports become Argo artifacts:
 - a pipeline input is an s3://<bucket>/<key> URL; Argo reads the key from its default artifact
   repository (the bucket is not passed on)
-- a link between steps is `from: {{tasks.<step>.outputs.artifacts.<output>}}`
+- a link between steps is `from: {{tasks.<step>.outputs.artifacts.<output>}}`, except into a dataset port
+  (below)
 - a registered data lego as a step input (DataSource): external data gives a dataset port of a
   network tool its URL (the tool reads it in place); managed STAC data is staged from its `location` key
   for a file or directory port. Iceberg data has no driver here yet.
@@ -13,6 +14,8 @@ its argument list filled in (ToolLego.argv). File and directory ports become Arg
   read keys for exactly those keys (`Reader`): an init container presents the pod's projected
   service-account token to the vendor and writes an AWS credentials file the tool's SDK reads. The
   workflow's hydrowf/reads annotation records each step's keys, which is what the vendor scopes to.
+  A dataset port may also read an earlier step's output in place (a link): that output's key is then
+  <run>/<step>/<output>/ (linked_prefix), which render knows; it needs the workflow's name.
 - no workflow is named `managed`: its outputs would land under managed/, where managed data lives
 - a tool's `files` are raw artifacts
 - an output is stored as files (archive: none), unless its data lego's storage says archive: tgz, in
@@ -42,7 +45,7 @@ from dataclasses import dataclass
 
 from hydrowf_core.models.lego import (MANAGED_PREFIX, PLAIN_KEY, DataLego, DataSource, ExternalStorage, Lego, Link,
                                       Pipeline, PipelineInput, Port, Scalar, StacStorage, Step, ToolLego, Value,
-                                      chosen_format, fill, format_name, value_problem)
+                                      chosen_format, fill, format_name, semver, value_problem)
 from hydrowf_core.registry.validate import data_source_problem
 
 FILE_TYPES = ("file", "directory")
@@ -245,7 +248,7 @@ def caller_read(where: str, url: object, reader: Reader | None) -> str:
 
 def task_inputs(step: Step, tool: ToolLego, values: dict[str, Scalar | None],
                 data: Mapping[tuple[str, str], DataLego] | None = None, reader: Reader | None = None,
-                input_types: Mapping[str, str] | None = None
+                input_types: Mapping[str, str] | None = None, linked: Mapping[tuple[str, str], str] | None = None
                 ) -> tuple[dict[str, Scalar | None], dict[str, dict], list[str]]:
     """Where each of the tool's inputs comes from, for one step.
 
@@ -257,6 +260,7 @@ def task_inputs(step: Step, tool: ToolLego, values: dict[str, Scalar | None],
 
     `input_types` is the pipeline's input name -> port type: a dataset port reads in place only from a
     `dataset` pipeline input (whose value the caller's service checked as one), never from any other.
+    `linked`: (step, output) -> the key of an earlier step's output that a dataset port reads in place.
     """
     scalars: dict[str, Scalar | None] = {}
     artifacts: dict[str, dict] = {}
@@ -271,6 +275,13 @@ def task_inputs(step: Step, tool: ToolLego, values: dict[str, Scalar | None],
             else:
                 scalars[port.name] = value
             reads += [read] if read else []
+            continue
+        if isinstance(src, Link) and port.type == "dataset":     # read in place from the key render gave it
+            key = (linked or {}).get((src.step, src.output))
+            if key is None:                       # registry.check refuses such a link; never a KeyError here
+                raise UnsupportedForArgo(f"{where}.{port.name}: {src.step}.{src.output} has no key to read in place")
+            scalars[port.name] = in_place(f"{where}.{port.name}", key, reader)
+            reads.append(key)
             continue
         if isinstance(src, Link):
             artifacts[port.name] = {"from": f"{{{{tasks.{src.step}.outputs.artifacts.{k8s_name(src.output)}}}}}"}
@@ -355,33 +366,72 @@ def output_formats(pipeline: Pipeline, legos: Iterable[Lego]) -> dict[str, str]:
     return found
 
 
-def semver(version: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in version.split("."))      # SemVer: at most 32 characters
-
-
 OUTPUT_PREFIX = "{{workflow.name}}/{{pod.name}}"     # the artifact repository's default key format
 
 
-def output_artifact(port: Port, path: str, archives: Mapping[str, str], data: str | None = None) -> dict:
+def output_artifact(port: Port, path: str, archives: Mapping[str, str], data: str | None = None,
+                    prefix: str | None = None) -> dict:
     """The Argo output artifact of `port`, stored as its data lego says: `data`, the format the step
-    writes (default: the port's first)."""
+    writes (default: the port's first). Its key is under Argo's own prefix (the workflow and pod names it
+    fills in), or under `prefix` (<run>/<step>, linked_prefix) for an output a later step reads in place."""
     name = k8s_name(port.name)
     artifact = {"name": name, "path": path}
     data = data or next(iter(port.choices), "")
     if archives.get(data, "none") == "tgz":
+        if prefix is not None:                  # registry.check refuses it; a dataset port reads files
+            raise UnsupportedForArgo(f"output {port.name} is stored as one .tgz: it can't be read in place")
         return artifact                         # Argo's default: one <name>.tgz under OUTPUT_PREFIX
     artifact["archive"] = {"none": {}}          # each file its own object
+    prefix = prefix or OUTPUT_PREFIX
     if port.type == "directory":                # the trailing "/" makes artifact GC delete the files
-        artifact["s3"] = {"key": f"{OUTPUT_PREFIX}/{name}/"}
+        artifact["s3"] = {"key": f"{prefix}/{name}/"}
     else:                                       # its own folder: two outputs can share a file name
-        artifact["s3"] = {"key": f"{OUTPUT_PREFIX}/{name}/{path.rsplit('/', 1)[-1]}"}
+        artifact["s3"] = {"key": f"{prefix}/{name}/{path.rsplit('/', 1)[-1]}"}
     return artifact
+
+
+def linked_prefix(run: str, step: str) -> str:
+    """Where a step's outputs that a later step reads in place are stored: a key render knows, since the
+    later step's argument and its read keys (hydrowf/reads) name it before the run starts. Under the run's
+    own prefix and <job>/<x>/<output>-shaped, as hydrowf-ogc's checks of a job's keys expect. The output's
+    folder is k8s_name(output), as for every output (my_out: my-out)."""
+    return f"{run}/{step}"
+
+
+def linked_keys(template: dict, step: str, outputs: Iterable[str]) -> dict[tuple[str, str], str]:
+    """(step, output) -> the key `template` (container_template's) stores each of these outputs under, for
+    the later steps that read them in place. Taken from the template, whose paths the step's inputs filled,
+    and checked as caller_read checks a caller's key: a file name a caller's input made can't widen a read."""
+    names = {k8s_name(o): o for o in outputs}
+    found = {}
+    for artifact in template["outputs"]["artifacts"]:
+        if artifact["name"] in names:
+            key = artifact["s3"]["key"]
+            if not PLAIN_KEY.fullmatch(key) or any(p in ("", ".", "..") for p in key.removesuffix("/").split("/")):
+                raise BadInputs(f"step {step}: output {names[artifact['name']]}'s key {key!r} is not a plain key "
+                                "(A-Z a-z 0-9 . _ / -), so a later step can't read it in place")
+            found[(step, names[artifact["name"]])] = key
+    return found
+
+
+def in_place_links(pipeline: Pipeline, tools: Mapping[tuple[str, str], ToolLego]) -> set[tuple[str, str]]:
+    """(step, output) for each step output that a later step's dataset port reads in place."""
+    found = set()
+    for step in pipeline.steps:
+        tool = tools.get(step.tool.key())
+        for port in tool.inputs if tool else []:
+            src = step.inputs.get(port.name)
+            if port.type == "dataset" and isinstance(src, Link):
+                found.add((src.step, src.output))
+    return found
 
 
 def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | None], staged: Iterable[str],
                        entrypoint: Entrypoint | None, archives: Mapping[str, str] | None = None,
-                       reader: Reader | None = None, reads: Iterable[str] = ()) -> dict:
-    """One step's Argo template: stage inputs and files under the workdir, run, collect outputs."""
+                       reader: Reader | None = None, reads: Iterable[str] = (),
+                       linked: Mapping[str, str] | None = None) -> dict:
+    """One step's Argo template: stage inputs and files under the workdir, run, collect outputs. `linked`:
+    output name -> the key prefix of an output a later step reads in place (linked_prefix)."""
     formats = {p.name: chosen_format(step, p) for p in tool.outputs}
     runtime = {**scalars, "workdir": tool.workdir, "cpu": tool.cpu, "run": RUN_NAME,
                **{format_name(p.name): formats[p.name] for p in tool.outputs if p.formats}}
@@ -425,7 +475,8 @@ def container_template(step: Step, tool: ToolLego, scalars: dict[str, Scalar | N
     return {
         **template,
         "inputs": {"artifacts": in_artifacts},
-        "outputs": {"artifacts": [output_artifact(p, at(p.path), archives or {}, formats[p.name])
+        "outputs": {"artifacts": [output_artifact(p, at(p.path), archives or {}, formats[p.name],
+                                                  (linked or {}).get(p.name))
                                   for p in tool.outputs if p.type in FILE_TYPES]},
         "volumes": volumes,
         "container": container,
@@ -467,6 +518,12 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
     templates, tasks = [], []
     reads: dict[str, list[str]] = {}                # step -> the keys it reads in place
     input_types = {port.name: port.type for port in pipeline.inputs}
+    links_in_place = in_place_links(pipeline, tools)
+    if links_in_place and not name:
+        step, output = min(links_in_place)
+        raise UnsupportedForArgo(f"reading step {step}'s output {output} in place needs the workflow's name "
+                                 "(render's name): the reading step's argument and read keys name its key")
+    linked: dict[tuple[str, str], str] = {}         # (step, output) -> its key, for the steps that read it
     for step_name in pipeline.order():
         step = steps[step_name]
         tool = tools.get(step.tool.key())
@@ -474,14 +531,18 @@ def render(pipeline: Pipeline, legos: Iterable[Lego], inputs: Mapping[str, Scala
             raise UnsupportedForArgo(f"step {step_name}: {step.tool.id}@{step.tool.version} is not a registered tool")
         if "argo" not in tool.runs_on:
             raise UnsupportedForArgo(f"step {step_name}: {tool.id} does not run on argo")
-        scalars, artifacts, step_reads = task_inputs(step, tool, values, data, reader, input_types)
+        scalars, artifacts, step_reads = task_inputs(step, tool, values, data, reader, input_types, linked)
         ours = f"s3://{reader.bucket}/" if reader else ""
         if step_reads and any(isinstance(v, str) and v.startswith("s3://") and not v.startswith(ours)
                               for v in scalars.values()):
             # the step's S3 endpoint and keys are ours: an external s3:// source would go to our endpoint
             raise UnsupportedForArgo(f"step {step_name}: a step that reads our bucket in place can't also read "
                                      "another s3:// bucket")
-        templates.append(container_template(step, tool, scalars, artifacts, entrypoint, archives, reader, step_reads))
+        prefixes = {out: linked_prefix(name, step_name) for s, out in links_in_place if s == step_name}
+        template = container_template(step, tool, scalars, artifacts, entrypoint, archives, reader, step_reads,
+                                      prefixes)
+        linked.update(linked_keys(template, step_name, prefixes))   # the keys the later steps will read
+        templates.append(template)
         if step_reads:
             reads[step_name] = step_reads
         task: dict = {"name": step_name, "template": f"step-{step_name}"}

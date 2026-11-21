@@ -258,7 +258,8 @@ own policy: `GetObject`/`ListBucket` on the bucket, nothing else), so a session 
 ### D.4 For tools (decided 2026-11-20)
 
 A tool reads managed data or one of the caller's job outputs from a `dataset` port, in place, instead of
-having it staged (TEEHR reading `timeseries/*.parquet`). Links between steps of one run stay staged.
+having it staged (TEEHR reading `timeseries/*.parquet`). Links between steps of one run stayed staged
+here; D.7 (2026-11-21) lets a later step's dataset port read an earlier step's output in place.
 
 - **What a dataset port takes:** a managed STAC data lego (`{data: …}`, its `location`), or a pipeline
   input of type `dataset` given as `s3://<bucket>/<key>`: in our bucket, a plain key with no empty, `.` or
@@ -320,6 +321,32 @@ having it staged (TEEHR reading `timeseries/*.parquet`). Links between steps of 
 2. ~~The new cluster's S3~~: decided, EKS with AWS S3 and STS; test a sparse Zarr there (a missing key
    may answer 403, hydrowf-ogc docs/ogc.md Known gaps).
 3. ~~Order~~: decided, D.3 and D.4 together.
+
+### D.7 A step's output read in place by a later step (2026-11-21)
+
+Step 4's end-to-end pipeline (`ngiab-evaluation`, teehr-evaluation.md) feeds `teehr-evaluate`'s dataset port
+from the step before it. Until now a link was always staged (`from: {{tasks...}}`) and wiring wanted the same
+port type on both ends.
+
+- **Wiring:** a step's file or directory output may feed a later step's **dataset** port of the same data
+  lego, when that lego's newest version stores outputs as files (`archive: none`): a dataset port reads
+  files in place, not one `.tgz`.
+- **Render:** the output's key is `<run>/<step>/<output>/` (`<output>` as for every output key: `k8s_name`,
+  so `my_out` is `my-out`; a file's ends in its file name, which must be a plain key), not
+  `{{workflow.name}}/{{pod.name}}/<output>/`, whose pod name Argo only knows when the pod starts. The later
+  step's argument is `s3://<bucket>/<that key>` and the key goes into its `hydrowf/reads`, so its read
+  keys cover it; the DAG dependency stays. This needs the workflow's `name` (hydrowf-ogc always passes the
+  job id) and the `reader`; without either render refuses. Other outputs keep Argo's key.
+- **Why not resolve the pod at run time** (the vendor knows each step's pod): the tool's argument names the
+  key when the workflow is written, and Argo has no variable for another task's pod name.
+- **hydrowf-ogc and the vendor are unchanged:** the key is under the job's own prefix and has the
+  `<job>/<x>/<output>` shape `_own_key` and `_may_read` check; results come from Argo's node status
+  whatever the key; the vendor issues keys for the recorded reads.
+- **Retries:** a retried step writes the same key again, and a directory's objects from the failed attempt
+  stay (each pod had its own prefix before). Nothing retries today (render sets no retryStrategy); adding
+  retries means clearing the prefix first.
+- **Only file and directory outputs can be linked** (check refuses the rest): a scalar or `dataset` output
+  has no objects to stage or read.
 
 ## 8. Work breakdown
 

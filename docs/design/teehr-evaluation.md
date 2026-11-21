@@ -14,7 +14,8 @@ observations only.
    a job output like any other (files, a STAC Item, read keys).
 2. **The evaluation knows nothing about ngen.** `teehr-evaluate` reads `teehr-timeseries`, a format any
    model's tool can write. ngen is one writer: ngiab-to-cng writes it as a second format.
-3. **The simulated series are read in place** with the step's vended keys (Part D), not staged.
+3. **The simulated series are read in place** with the step's vended keys (Part D), not staged: from a
+   caller's job output, or from the step before (formats-and-data-inputs.md D.7).
 
 Non-goals: USGS daily means for gages without instantaneous data; variables other than streamflow; a
 TEEHR warehouse that keeps evaluations across jobs; the TEEHR-Cloud warehouse; the metrics in a UI.

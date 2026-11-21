@@ -552,6 +552,11 @@ def format_name(output: str) -> str:
     return f"{output}_format"
 
 
+def semver(version: str) -> tuple[int, ...]:
+    """A lego version as numbers, for ordering versions: 1.10.0 is newer than 1.9.0."""
+    return tuple(int(part) for part in version.split("."))      # SemVer: at most 32 characters
+
+
 def chosen_format(step: Step, port: Port) -> str | None:
     """The data lego `step` writes to its tool's output `port`: the step's choice, else the first format."""
     return step.formats.get(port.name) or next(iter(port.choices), None)
