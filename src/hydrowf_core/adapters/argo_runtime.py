@@ -12,6 +12,7 @@ The bucket is the cluster's artifact repository bucket: Argo records only the ke
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,6 +42,12 @@ class RunStatus:
     # pipeline output -> the data lego it was written as, "id@version" (render()'s hydrowf/formats); {} for
     # runs rendered before formats
     formats: dict[str, str] = field(default_factory=dict)
+    # step -> the keys it reads in place (render()'s hydrowf/reads): what a step's read keys may cover
+    reads: dict[str, list[str]] = field(default_factory=dict)
+    uid: str = ""                         # the Workflow object's uid (its step pods' controlling owner)
+    # step -> (the name of the pod Argo made for it, that node's phase): what a pod claiming to be a step
+    # must match (Argo's pod naming v2: <workflow>-<template>-<node id's hash>)
+    step_pods: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     @property
     def finished(self) -> bool:
@@ -157,6 +164,29 @@ def outputs_of(annotations: dict[str, str]) -> dict[str, str]:
     return found
 
 
+PLAIN_KEY = re.compile(r"[A-Za-z0-9._/-]+")
+
+
+def plain_key(key: object) -> bool:
+    return isinstance(key, str) and bool(PLAIN_KEY.fullmatch(key)) and all(
+        part not in ("", ".", "..") for part in key.removesuffix("/").split("/"))
+
+
+def reads_of(annotations: dict[str, str]) -> dict[str, list[str]]:
+    """The hydrowf/reads annotation as {step: [keys]}; {} when it is missing or isn't that shape, or any key
+    isn't a plain key (no empty, `.` or `..` part). Read keys are scoped to it, so it is checked here again:
+    render writes it, but anyone who may edit workflows could change it."""
+    try:
+        found = json.loads(annotations.get("hydrowf/reads", "{}"))
+    except ValueError:
+        return {}
+    if not isinstance(found, dict) or not all(
+            isinstance(step, str) and isinstance(keys, list) and keys and all(plain_key(k) for k in keys)
+            for step, keys in found.items()):
+        return {}
+    return found
+
+
 def formats_of(annotations: dict[str, str]) -> dict[str, str]:
     """The hydrowf/formats annotation as {output: "id@version"}; {} when it is missing or isn't that shape
     (render() writes it, but anyone who may edit workflows could change it)."""
@@ -170,15 +200,37 @@ def formats_of(annotations: dict[str, str]) -> dict[str, str]:
     return found
 
 
+def step_pods(workflow: str, nodes: list) -> dict[str, tuple[str, str]]:
+    """Step -> (pod name, phase) for the Pod nodes of `workflow`, by Argo's pod naming v2 (its default):
+    <workflow>-<template>-<the node id after "<workflow>-">. Argo names a retry's or loop's pod nodes eval(0),
+    eval(1): they are steps of their own here, which render records no reads for. Two Pod nodes with one
+    display name would make the pod ambiguous: that step is left out (defensive; Argo doesn't make them)."""
+    found: dict[str, tuple[str, str]] = {}
+    seen: set[str] = set()
+    for node in nodes:
+        step, node_id = node.display_name, node.id or ""
+        if not node_id.startswith(f"{workflow}-") or not node.template_name:
+            continue
+        if step in seen:
+            found.pop(step, None)
+            continue
+        seen.add(step)
+        found[step] = (f"{workflow}-{node.template_name}-{node_id[len(workflow) + 1:]}", node.phase or "Pending")
+    return found
+
+
 def run_status(wf: m.Workflow) -> RunStatus:
     """A RunStatus from one workflow (a get_workflow answer or a list_workflows item)."""
     meta, status = wf.metadata, wf.status
     labels = dict(meta.labels or {})
     common = dict(pipeline=labels.get("hydrowf/pipeline", ""), labels=labels, created_at=time(meta.creation_timestamp),
-                  formats=formats_of(meta.annotations or {}))
+                  formats=formats_of(meta.annotations or {}), reads=reads_of(meta.annotations or {}),
+                  uid=meta.uid or "")
     if status is None:                                   # the controller hasn't picked it up yet
         return RunStatus(meta.name, "Pending", **common)
-    steps = {n.display_name: n.phase or "Pending" for n in (status.nodes or {}).values() if n.type == "Pod"}
+    pods = [n for n in (status.nodes or {}).values() if n.type == "Pod"]
+    steps = {n.display_name: n.phase or "Pending" for n in pods}
     return RunStatus(meta.name, status.phase or "Pending", status.message or "", steps, **common,
+                     step_pods=step_pods(meta.name, pods),
                      started_at=time(status.started_at), finished_at=time(status.finished_at),
                      progress=progress(steps, plan(wf), status.progress or ""))

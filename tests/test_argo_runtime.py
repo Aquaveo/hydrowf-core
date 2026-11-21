@@ -94,7 +94,9 @@ def test_status_of_a_finished_run():
     assert status == RunStatus(NAME, "Succeeded", "", {"preprocess": "Succeeded", "run": "Succeeded"},
                                pipeline="ngiab-simulation", created_at=at("2026-11-15T00:29:58Z"),
                                started_at=at("2026-11-15T00:29:58Z"), finished_at=at("2026-11-15T00:40:15Z"),
-                               progress="2/2", labels=LABELS)
+                               progress="2/2", labels=LABELS,
+                               step_pods={"preprocess": (f"{NAME}-step-preprocess-3868047524", "Succeeded"),
+                                          "run": (f"{NAME}-step-run-432766967", "Succeeded")})
     assert status.finished
 
 
@@ -259,3 +261,39 @@ def test_listed_and_not_yet_started_runs_carry_their_formats_too():
     assert runtime(listed=[wf]).list()[0].formats == {"run": "ngen-run@1.0.0"}
     pending = {k: v for k, v in wf.items() if k != "status"}
     assert runtime(pending).status(NAME).formats == {"run": "ngen-run@1.0.0"}
+
+
+def test_status_carries_what_each_step_reads_in_place():
+    wf = copy.deepcopy(SUCCEEDED)
+    reads = {"eval": ["job-1/job-1-step-x-1/cng/", "managed/hf/a.gpkg"]}
+    wf["metadata"]["annotations"]["hydrowf/reads"] = json.dumps(reads)
+    assert runtime(wf).status(NAME).reads == reads
+
+
+@pytest.mark.parametrize("annotation", [
+    "not json", "[]", '{"eval": "job-1/"}', '{"eval": []}', '{"eval": [""]}', '{"eval": ["job-1/../job-2/"]}',
+    '{"eval": ["a//b"]}', '{"eval": ["{{workflow.name}}/x"]}', '{"eval": ["a b"]}',
+], ids=["not-json", "not-an-object", "not-a-list", "empty-list", "whole-bucket", "dotdot", "empty-part",
+        "template", "space"])
+def test_an_unreadable_or_unsafe_reads_annotation_reads_nothing(annotation):
+    wf = copy.deepcopy(SUCCEEDED)
+    wf["metadata"]["annotations"]["hydrowf/reads"] = annotation
+    assert runtime(wf).status(NAME).reads == {}
+
+
+def test_status_names_each_steps_pod_as_argo_does():
+    wf = copy.deepcopy(SUCCEEDED)
+    wf["metadata"]["uid"] = "f0f7d8fd-7a10-423b-befa-878c6dba6894"
+    status = runtime(wf).status(NAME)
+    assert status.uid == "f0f7d8fd-7a10-423b-befa-878c6dba6894"
+    # <workflow>-<template>-<node id after "<workflow>-">, as the pods on kind are named
+    assert status.step_pods["run"] == (f"{NAME}-step-run-432766967", "Succeeded")
+    assert status.step_pods["preprocess"] == (f"{NAME}-step-preprocess-3868047524", "Succeeded")
+
+
+def test_a_step_with_two_pods_names_none():                # defensive: Argo names retries run(0), run(1)
+    wf = copy.deepcopy(SUCCEEDED)
+    nodes = wf["status"]["nodes"]
+    run = next(n for n in nodes.values() if n.get("displayName") == "run")
+    nodes[f"{NAME}-111"] = {**run, "id": f"{NAME}-111", "name": f"{NAME}.run(1)"}       # a retry
+    assert "run" not in runtime(wf).status(NAME).step_pods
