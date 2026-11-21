@@ -287,15 +287,18 @@ having it staged (TEEHR reading `timeseries/*.parquet`). Links between steps of 
 - **The vendor** is an internal port of hydrowf-ogc (not on the ingress). Its rules (PR 7b):
   1. TokenReview with **`audiences: [hydrowf-vendor]`**: only the init container's token passes, not the
      pod's default service-account token (also bound to the pod, and visible to the tool).
-  2. The pod (from the review's pod name and uid, which must match) belongs to a workflow carrying
-     hydrowf-ogc's labels (`hydrowf/owner`, `hydrowf/pipeline`), and to one of its steps.
+  2. The pod (from the review's pod name and uid, which must match) is controlled by a workflow (by its
+     uid) carrying hydrowf-ogc's labels (`hydrowf/owner`, `hydrowf/pipeline`), and is the very pod Argo
+     made for one of its steps: the name Argo derives for the step's node (`RunStatus.step_pods`), whose
+     phase is Pending or Running. A look-alike pod can't take a running step's pod name.
   3. The keys are that step's entry in `hydrowf/reads`, each checked again (our bucket, a plain key);
      a folder key (ending in `/`) covers what is under it, any other key that one object.
   4. 1-hour keys (the most role chaining allows on EKS), scoped as D.2. No refresh: a step that reads for
      longer fails its reads after that, until a tool needs more.
-  `hydrowf/reads` is trusted because only hydrowf-ogc creates workflows in its namespace: anyone else
-  with workflow create rights there (Argo UI or CLI users, CI) could write any keys. The deployment
-  (PR 7c) keeps those rights to hydrowf-ogc's service account.
+  **Trust boundary** (PR 7c's RBAC): in the workflows' namespace only hydrowf-ogc (and cluster admins)
+  may create workflows (they could write any `hydrowf/reads`), create pods, `pods/exec`, or create
+  `serviceaccounts/token`; the tools' service account none of these. The token and keys cross the pod
+  network in plain HTTP: a NetworkPolicy keeps the vendor's port to the workflows' namespace.
 - `check()` allows managed data on dataset ports; render refuses them without a `reader`.
 
 ### D.5 Security notes
