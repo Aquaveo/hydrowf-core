@@ -8,7 +8,7 @@ in place) is a draft for review (2026-11-20). Part of the data MVP:
 | 1 | Outputs stored as files | merged (core #15, ogc #23) |
 | 2 | STAC Items from each output's manifest | merged (ogc #24, tools #10) |
 | **3** | **Tool-declared output formats; data legos as inputs; NGIAB round trip; reading in place** | **this document** |
-| 4 | TEEHR evaluation (`teehr-timeseries`, `teehr-evaluate`) | after 3, builds on its formats |
+| 4 | TEEHR evaluation (`teehr-timeseries`, `teehr-evaluate`) | after 3, builds on its formats (`teehr-evaluation.md`) |
 
 ## 1. Goals
 
