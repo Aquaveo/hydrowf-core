@@ -5,7 +5,9 @@ The models validate each lego on its own. What needs other legos is here:
 - a pipeline step's tool exists (at the pinned version) and is a tool
 - every step input is a port of that tool; every required port is given
 - each source fits its port: same kind (scalar type, file, directory, dataset) and same data lego id
-  (an input with a default may stay unconnected); a link carries the format its step chose
+  (an input with a default may stay unconnected); a link carries the format its step chose, and only a
+  file or directory output can be linked: into a port of its own kind, or into a later step's dataset
+  port of its data lego, read in place unless that lego packs outputs into one .tgz (design D.7)
 - a step's format choices name outputs that list formats, and one of their formats
 - a data lego feeds a port its driver can serve: external data a dataset port of a tool that declares
   `network: true` (the tool reads the URL in place); managed STAC data a file or directory port (staged
@@ -21,7 +23,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from hydrowf_core.models.lego import (DataLego, DataSource, ExternalStorage, Lego, Link, Pipeline, PipelineInput,
-                                      Port, StacStorage, Step, ToolLego, Value, chosen_format, value_problem)
+                                      Port, StacStorage, Step, ToolLego, Value, chosen_format, semver,
+                                      value_problem)
 
 
 def check(legos: Iterable[Lego]) -> list[str]:
@@ -118,6 +121,17 @@ def managed_problem(data_id: str, location: str, port_type: str) -> str | None:
     return None
 
 
+def linked_read_problem(what: str, data: str, by_key: dict[tuple[str, str], Lego]) -> str | None:
+    """Why a later step's dataset port can't read the step output `what` (of data lego `data`) in place: the
+    data lego's newest version, which render stores the output by, keeps it as one .tgz."""
+    versions = [x for x in by_key.values() if isinstance(x, DataLego) and x.id == data]
+    newest = max(versions, key=lambda x: semver(x.version), default=None)
+    if newest is not None and isinstance(newest.storage, StacStorage) and newest.storage.archive == "tgz":
+        return (f"{what} is stored as one .tgz ({data}: archive tgz): a dataset port reads files in place, "
+                "so it can't read it")
+    return None
+
+
 def format_problems(step: Step, tool: ToolLego) -> list[str]:
     """What is wrong with `step`'s format choices for `tool`."""
     outputs = {port.name: port for port in tool.outputs}
@@ -157,7 +171,11 @@ def source_problem(port: Port, src: Value | PipelineInput | Link | DataSource,
         if upstream is None:
             return f"{tool.id} has no output {src.output!r}"
         what = f"{src.step}.{src.output}"
+        if upstream.type not in ("file", "directory"):
+            return f"{what} is a {upstream.type} output: only file and directory outputs can be linked"
         data = chosen_format(steps[src.step], upstream)  # the format that step writes
+        if port.type == "dataset" and data == port.data:
+            return linked_read_problem(what, data, by_key)   # read in place from a key render gives it (D.7)
     if (upstream.type, data) != (port.type, port.data):
         return (f"{what} is {upstream.type}{f' of {data}' if data else ''}, "
                 f"the port wants {port.type}{f' of {port.data}' if port.data else ''}")
