@@ -295,9 +295,13 @@ having it staged (TEEHR reading `timeseries/*.parquet`). Links between steps of 
      a folder key (ending in `/`) covers what is under it, any other key that one object.
   4. 1-hour keys (the most role chaining allows on EKS), scoped as D.2. No refresh: a step that reads for
      longer fails its reads after that, until a tool needs more.
-  **Trust boundary** (PR 7c's RBAC): in the workflows' namespace only hydrowf-ogc (and cluster admins)
-  may create workflows (they could write any `hydrowf/reads`), create pods, `pods/exec`, or create
-  `serviceaccounts/token`; the tools' service account none of these. The token and keys cross the pod
+  **Trust boundary** (hydrowf-deploy's RBAC): in the workflows' namespace only hydrowf-ogc creates
+  workflows (they could write any `hydrowf/reads`), through argo-server with the identity behind its Argo
+  token; only Argo's controller creates pods; nobody but cluster admins has `pods/exec` or creates
+  `serviceaccounts/token`. The tools' service account has none of these (executor and artifactgc only),
+  and no IAM role (IRSA or Pod Identity) that reaches the bucket: every container in a pod shares it, so
+  Argo's artifact repository uses a key in a Secret, which Argo hands only to its own containers. The
+  vendor's own account may only create TokenReviews and get pods. The token and keys cross the pod
   network in plain HTTP: a NetworkPolicy keeps the vendor's port to the workflows' namespace.
 - `check()` allows managed data on dataset ports; render refuses them without a `reader`.
 
