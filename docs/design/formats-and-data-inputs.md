@@ -8,7 +8,7 @@ in place) is a draft for review (2026-11-20). Part of the data MVP:
 | 1 | Outputs stored as files | merged (core #15, ogc #23) |
 | 2 | STAC Items from each output's manifest | merged (ogc #24, tools #10) |
 | **3** | **Tool-declared output formats; data legos as inputs; NGIAB round trip; reading in place** | **this document** |
-| 4 | TEEHR evaluation (`teehr-timeseries`, `teehr-evaluate`) | after 3, builds on its formats (`teehr-evaluation.md`) |
+| 4 | TEEHR evaluation (`teehr-timeseries`, `teehr-evaluate`) | after 3, builds on its formats (hydrowf-tools `docs/design/teehr-evaluation.md`) |
 
 ## 1. Goals
 
@@ -324,7 +324,7 @@ here; D.7 (2026-11-21) lets a later step's dataset port read an earlier step's o
 
 ### D.7 A step's output read in place by a later step (2026-11-21)
 
-Step 4's end-to-end pipeline (`ngiab-evaluation`, teehr-evaluation.md) feeds `teehr-evaluate`'s dataset port
+Step 4's end-to-end pipeline (`ngiab-evaluation`, hydrowf-tools docs/design/teehr-evaluation.md) feeds `teehr-evaluate`'s dataset port
 from the step before it. Until now a link was always staged (`from: {{tasks...}}`) and wiring wanted the same
 port type on both ends.
 
